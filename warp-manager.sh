@@ -1446,6 +1446,7 @@ apply_defaults() {
     for i in "${!DETECTED_IPS[@]}"; do PERIP_LABELS+=("loc$((i + 1))"); done
   fi
   [[ -n "$DOMAINS_CSV" ]] || DOMAINS_CSV="$DEFAULT_DOMAINS"
+  if [[ "$ROUTING" == "all" ]]; then RULE_PREPEND=1; else RULE_PREPEND=0; fi
   return 0
 }
 
@@ -1460,9 +1461,12 @@ choose_routing() {
     ans="$(ui_read "Domain list (comma separated) [Enter = default]: ")" || return 1
     [[ -n "$ans" ]] && DOMAINS_CSV="$ans"
   fi
-  RULE_PREPEND=1
   if [[ "$ROUTING" == "all" ]]; then
-    info "WARP outbound will be placed first in the outbounds array."
+    RULE_PREPEND=1
+    info "WARP outbound will be placed first in the outbounds array (default outbound)."
+  else
+    RULE_PREPEND=0
+    info "WARP will be appended; your existing first outbound stays the default."
   fi
   return 0
 }
@@ -1611,6 +1615,9 @@ cmd_apply() {
   header "$APP_NAME v$SCRIPT_VERSION - Apply Panel Config (${action})"
   have jq || die "jq is required for panel API integration."
   [[ -n "$PANEL_URL" ]] || die "Panel URL is required. Use --panel-url URL or PANEL_URL=... ."
+  local saved_routing
+  saved_routing="$(state_get ROUTING domains)"
+  if [[ "$saved_routing" == "all" ]]; then RULE_PREPEND=1; else RULE_PREPEND=0; fi
   local f
   for f in outbounds.json routing-rules.json balancers.json; do
     [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."

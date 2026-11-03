@@ -105,6 +105,21 @@ check "dry-run makes no changes" bash -c "printf '%s' \"\$1\" | grep -q 'No chan
 check "dry-run created no wgcf binary" test ! -e "$WORK/plan-app/bin/wgcf"
 
 # ---------------------------------------------------------------------------
+printf '\n[5a] Routing scope controls outbound position\n'
+cat >"$WORK/prepend.sh" <<'EOF'
+source "$WARP_MANAGER"
+ASSUME_YES=0
+choose_routing >/dev/null 2>&1
+printf '%s|%s' "$ROUTING" "$RULE_PREPEND"
+EOF
+d_out="$(printf '1\n\n' | WARP_APP_DIR="$WORK/prepend-a" \
+  WARP_MANAGER="$ROOT/warp-manager.sh" bash "$WORK/prepend.sh" 2>/dev/null || true)"
+a_out="$(printf '2\n' | WARP_APP_DIR="$WORK/prepend-b" \
+  WARP_MANAGER="$ROOT/warp-manager.sh" bash "$WORK/prepend.sh" 2>/dev/null || true)"
+assert_eq "domains mode keeps the existing default outbound" "domains|0" "$d_out"
+assert_eq "all mode places WARP first" "all|1" "$a_out"
+
+# ---------------------------------------------------------------------------
 printf '\n[5b] Full interactive wizard with empty optional answers\n'
 cat >"$WORK/wizard.sh" <<'EOF'
 source "$WARP_MANAGER"
