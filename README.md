@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.3
+  PasarGuard WARP Manager  v1.0.4
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -194,8 +194,11 @@ sudo warp-manager unapply --panel-url https://panel.example.com \
   --panel-user admin --panel-pass 'secret' --core-id 1 --yes
 ```
 
-`apply` pushes the already-generated snippets into Core Settings (useful when
-the API login failed during the first install); `unapply` removes them.
+`apply` also re-checks `/dev/net/tun` on **every** node container on the host
+(`out-node`, `main-node`, ...), then pushes the already-generated snippets into
+Core Settings (useful when the API login failed during the first install).
+`unapply` removes them. `warp-manager fix-compose --yes` only re-runs the TUN
+part without touching the panel.
 
 ---
 

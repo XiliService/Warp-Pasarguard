@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.0.4"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -451,6 +451,58 @@ print_environment() {
       printf '    - %-18s via %s\n' "${DETECTED_IPS[$i]}" "${DETECTED_IFACES[$i]}"
     done
   fi
+}
+
+# -----------------------------------------------------------------------------
+# Docker compose patch: /dev/net/tun + security_opt
+# -----------------------------------------------------------------------------
+# Emit "compose_file|compose_service|container" for EVERY running node
+# container. A host can run several nodes (e.g. out-node + main-node) and all
+# of them may execute the WARP outbound, so patching only the first is wrong.
+node_compose_targets() {
+  local name cfg hint image
+  have docker || return 0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    image="$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || true)"
+    [[ "$name" == *node* || "$image" == *node* ]] || continue
+    cfg="$(docker inspect "$name" \
+            --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' 2>/dev/null || true)"
+    cfg="${cfg%%,*}"
+    [[ -n "$cfg" && "$cfg" != "<no value>" && -f "$cfg" ]] || continue
+    hint="$(docker inspect "$name" \
+            --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null || true)"
+    [[ "$hint" == "<no value>" ]] && hint=""
+    printf '%s|%s|%s\n' "$cfg" "$hint" "$name"
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null || true)
+  return 0
+}
+
+# Patch every node compose file. Falls back to the old single-file detection
+# when Docker labels are unavailable (e.g. node installed as a systemd unit).
+patch_node_composes() {
+  local file hint container rest key t
+  local -a targets=() seen=()
+  while IFS='|' read -r file hint container; do
+    [[ -n "$file" ]] || continue
+    key="${file}|${hint}"
+    [[ " ${seen[*]:-} " == *" ${key} "* ]] && continue
+    seen+=("$key"); targets+=("${key}|${container}")
+  done < <(node_compose_targets)
+  if (( ${#targets[@]} == 0 )); then
+    COMPOSE_FILE=""; COMPOSE_SERVICE_HINT=""; COMPOSE_CONTAINER=""
+    patch_compose
+    return 0
+  fi
+  info "Found ${#targets[@]} node compose target(s); patching all of them."
+  for t in "${targets[@]}"; do
+    file="${t%%|*}"; rest="${t#*|}"
+    hint="${rest%%|*}"; container="${rest##*|}"
+    COMPOSE_FILE="$file"; COMPOSE_SERVICE_HINT="$hint"; COMPOSE_CONTAINER="$container"
+    patch_compose || return 1
+  done
+  ok "All node containers now have /dev/net/tun permissions."
+  return 0
 }
 
 detect_compose() {
@@ -937,7 +989,9 @@ rollback_kernel() {
 # Docker Compose TUN permissions
 # -----------------------------------------------------------------------------
 patch_compose() {
-  detect_compose || { warn "No docker-compose.yml found. Add the TUN settings manually if your node runs in Docker."; return 0; }
+  if [[ -z "${COMPOSE_FILE:-}" ]]; then
+    detect_compose || { warn "No docker-compose.yml found. Add the TUN settings manually if your node runs in Docker."; return 0; }
+  fi
   compose_services
   local services="${COMPOSE_SERVICES:-}"
   [[ -n "$services" ]] || { warn "Could not detect services in ${COMPOSE_FILE}."; return 0; }
@@ -1257,7 +1311,7 @@ apply_to_panel() {
   }
   ok "Core config ${core_id} updated and nodes notified."
   PANEL_APPLY_OK=1
-  state_set_many "PANEL_CORE_ID=$core_id" "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PANEL_LAST_BACKUP=$snapshot"
+  state_set_many "PANEL_URL=$PANEL_URL" "PANEL_CORE_ID=$core_id" "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PANEL_LAST_BACKUP=$snapshot"
   cp -f -- "$merged" "$OUTPUT_DIR/core-config-preview.json"
   rm -f -- "$merged"
 }
@@ -1584,14 +1638,14 @@ cmd_install() {
   fi
   if [[ "$MODE" == "xray" && "$TARGET" != "generator" ]]; then
     ensure_tun_device
-    patch_compose
+    patch_node_composes
   fi
 
   state_set_many \
     "INSTALLED=1" "MODE=$MODE" "TARGET=$TARGET" "BINDING=$BINDING" \
     "ROUTING=$ROUTING" "ENDPOINT=$ENDPOINT" "DOMAINS=$DOMAINS_CSV" \
     "PROFILES=${names[*]}" "INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    "SCRIPT_VERSION=$SCRIPT_VERSION" "STATE_VERSION=1"
+    "SCRIPT_VERSION=$SCRIPT_VERSION" "STATE_VERSION=1" "PANEL_URL=$PANEL_URL"
 
   if [[ "$APPLY_PANEL" != "no" && -n "$PANEL_URL" ]]; then
     apply_to_panel apply
@@ -1615,8 +1669,8 @@ cmd_fix_compose() {
   state_init
   header "$APP_NAME v$SCRIPT_VERSION - Fix Compose TUN Permissions"
   is_installed || warn "WARP is not marked as installed; this only patches docker-compose.yml."
-  patch_compose
-  info "Done. Recreate the container if you declined the restart."
+  patch_node_composes
+  info "Done. Recreate any container whose restart was declined."
   return 0
 }
 
@@ -1629,19 +1683,26 @@ cmd_apply() {
   local saved_routing
   saved_routing="$(state_get ROUTING domains)"
   if [[ "$saved_routing" == "all" ]]; then RULE_PREPEND=1; else RULE_PREPEND=0; fi
+  if [[ "$action" == "apply" ]]; then
+    info "Step 1/2 - ensure every node container has /dev/net/tun."
+    patch_node_composes || warn "Compose patching had a problem; TUN may already be available on the host."
+    info "Step 2/2 - push the WARP outbound/rules into the panel Core Settings."
+  else
+    info "Removing the WARP outbound/rules from the panel Core Settings."
+  fi
   local f
   for f in outbounds.json routing-rules.json balancers.json; do
     [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
   done
-  if [[ "$action" == "apply" ]]; then
-    info "Pushing the generated WARP outbound/rules into the panel Core Settings."
-  else
-    info "Removing the WARP outbound/rules from the panel Core Settings."
-  fi
   apply_to_panel "$action"
   [[ "$PANEL_APPLY_OK" == "1" ]] || die \
     "Panel config was NOT applied. Read the error above, or paste the snippets manually (see ${OUTPUT_DIR}/README.txt)."
-  info "Done. Verify with: warp-manager status"
+  if [[ "$action" == "apply" ]]; then
+    ok "WARP is now ACTIVE in the panel config."
+    info "Final test, from a CLIENT config: https://ipinfo.io/json with 'tunnel' vs 'direct'."
+  else
+    ok "WARP outbound/rules removed from the panel config."
+  fi
   return 0
 }
 
@@ -1930,6 +1991,12 @@ cmd_status() {
   else
     warn "  Docker compose TUN permissions: not patched by this tool"
   fi
+  if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
+    bad "  NOT ACTIVE - the snippets were generated but NOT applied to the panel."
+    problems=$((problems + 1))
+  else
+    ok "  Panel config applied at $(state_get PANEL_LAST_APPLY never)"
+  fi
   line
 
   header "Connectivity"
@@ -1957,10 +2024,18 @@ cmd_status() {
   fi
   line
 
+  if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
+    header "Next step (one command)"
+    local next_url; next_url="$(state_get PANEL_URL '')"
+    [[ -n "$next_url" ]] || next_url="PANEL_URL"
+    info "  warp-manager apply --panel-url ${next_url} --panel-user USER --panel-pass PASS --yes"
+    info "  It also re-checks /dev/net/tun on every node container."
+    line
+  fi
   if (( problems == 0 )); then
     ok "Overall health: OK"
   else
-    warn "Overall health: ${problems} item(s) need attention. Run 'warp-manager logs' for details."
+    warn "Overall health: ${problems} item(s) need attention."
   fi
 }
 
@@ -1977,6 +2052,9 @@ print_banner() {
   printf '  %-18s %s\n' "Primary IP" "$PRIMARY_IP"
   printf '  %-18s %s\n' "Global IPs" "${#DETECTED_IPS[@]}"
   printf '  %-18s %s\n' "Installation" "$([[ "$(state_get INSTALLED 0)" == "1" ]] && printf 'active (%s / %s)' "$(state_get MODE '?')" "$(state_get TARGET '?')" || echo 'not installed')"
+  if [[ "$(state_get INSTALLED 0)" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
+    printf '  %-18s %s\n' "Status" "installed, NOT ACTIVE - run 'warp-manager apply'"
+  fi
   printf '%s\n' "------------------------------------------------------------------------"
 }
 

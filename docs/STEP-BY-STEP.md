@@ -78,7 +78,7 @@ What the command means:
 Expected output:
 
 ```
-  PasarGuard WARP Manager - Bootstrap Installer v1.0.3
+  PasarGuard WARP Manager - Bootstrap Installer v1.0.4
 ==> Trying https://api.github.com/repos/.../contents/warp-manager.sh?ref=...
 ==> Installed: /opt/pasarguard-warp/warp-manager.sh
 ==> Command  : /usr/local/bin/warp-manager
@@ -92,7 +92,7 @@ Verify the installation:
 
 ```bash
 which warp-manager
-warp-manager --version          # PasarGuard WARP Manager 1.0.3
+warp-manager --version          # PasarGuard WARP Manager 1.0.4
 ls -l /usr/local/bin/warp-manager
 ```
 
@@ -272,6 +272,12 @@ sudo warp-manager apply --panel-url https://panel.example.com \
 `PANEL_URL` must be the dashboard root (do **not** append `/api`). The admin
 account needs `cores:read` and `cores:update` permissions. Use `--insecure`
 only for self-signed certificates. `warp-manager unapply` reverses the change.
+`apply` also patches `/dev/net/tun` into every node container on the host, so
+it is the single command that finishes an interrupted install.
+
+The manager log is a **history**, not current state. Lines from earlier failed
+attempts stay in the file; only the last few lines describe the present state.
+Use `warp-manager status` for the current state.
 
 ---
 

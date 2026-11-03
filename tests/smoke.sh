@@ -13,16 +13,18 @@ trap 'rm -rf -- "$WORK"' EXIT
 PASS=0
 FAIL=0
 
-ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS + 1)); }
-fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL + 1)); }
+# Names are prefixed because sourcing warp-manager.sh later in this file
+# defines its own ok()/fail() helpers, which used to shadow these counters.
+t_ok()   { printf '  \033[32mPASS\033[0m  %s\n' "$*"; PASS=$((PASS + 1)); }
+t_fail() { printf '  \033[31mFAIL\033[0m  %s\n' "$*"; FAIL=$((FAIL + 1)); }
 check() {
   local label="$1"; shift
-  if "$@" >/dev/null 2>&1; then ok "$label"; else fail "$label"; fi
+  if "$@" >/dev/null 2>&1; then t_ok "$label"; else t_fail "$label"; fi
 }
 assert_eq() {
   local label="$1" expected="$2" actual="$3"
-  if [[ "$expected" == "$actual" ]]; then ok "$label"; else
-    fail "$label (expected '${expected}', got '${actual}')"
+  if [[ "$expected" == "$actual" ]]; then t_ok "$label"; else
+    t_fail "$label (expected '${expected}', got '${actual}')"
   fi
 }
 
@@ -55,9 +57,9 @@ check "--help documents the fix-compose command" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'fix-compose Re-detect'"
 apply_err="$(WARP_APP_DIR="$WORK/apply-app" bash "$ROOT/warp-manager.sh" apply --yes 2>&1 || true)"
 if printf '%s' "$apply_err" | grep -q 'Panel URL is required'; then
-  ok "apply without a panel URL fails with a clear message"
+  t_ok "apply without a panel URL fails with a clear message"
 else
-  fail "apply without a panel URL fails with a clear message"
+  t_fail "apply without a panel URL fails with a clear message"
 fi
 
 
@@ -85,9 +87,9 @@ check "piped installer creates the symlink" test -L "$WORK/pipe-bin/warp-manager
 check "piped installer reports Done" grep -q 'Done' "$WORK/pipe.log"
 pipe_ver="$(cat "$ROOT/warp-manager.sh" | bash -s -- --version 2>&1)"
 if printf '%s' "$pipe_ver" | grep -q 'PasarGuard WARP Manager'; then
-  ok "manager itself runs from stdin"
+  t_ok "manager itself runs from stdin"
 else
-  fail "manager itself runs from stdin"
+  t_fail "manager itself runs from stdin"
 fi
 
 # ---------------------------------------------------------------------------
@@ -401,6 +403,55 @@ WARP_APP_DIR="$WORK/compose-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
     patch_compose >/dev/null 2>&1' || true
 check "patch_compose auto-selects the node service without a prompt" \
   grep -q '/dev/net/tun:/dev/net/tun' "$WORK/compose2/docker-compose.yml"
+
+# ---------------------------------------------------------------------------
+printf '\n[8c] Every node container is patched (out-node + main-node)\n'
+mkdir -p "$WORK/fakebin3" "$WORK/nodeA" "$WORK/nodeB"
+for d in nodeA nodeB; do
+  cat >"$WORK/$d/docker-compose.yml" <<'YAML'
+services:
+  node:
+    image: pasarguard/node:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+YAML
+done
+cat >"$WORK/fakebin3/docker" <<EOF
+#!/usr/bin/env bash
+A="$WORK/nodeA/docker-compose.yml"
+B="$WORK/nodeB/docker-compose.yml"
+case "\${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1\nout-node\nmain-node\n'; exit 0 ;;
+  inspect)
+    name="\$2"; fmt="\$4"
+    case "\$fmt" in
+      *config_files*)
+        if [[ "\$name" == "out-node" ]]; then printf '%s\n' "\$A"
+        elif [[ "\$name" == "main-node" ]]; then printf '%s\n' "\$B"
+        else printf '%s\n' "\$A"; fi ;;
+      *com.docker.compose.service*) printf 'node\n' ;;
+      *Config.Image*)
+        if [[ "\$name" == *node* ]]; then printf 'pasarguard/node:latest\n'
+        else printf 'pasarguard/panel:latest\n'; fi ;;
+    esac
+    exit 0 ;;
+  compose) exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin3/docker"
+WARP_APP_DIR="$WORK/multinode-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin3:$PATH" ASSUME_YES=1 bash -c '
+    source "$WARP_MANAGER"
+    node_compose_targets > "'"$WORK"'/targets.txt"
+    patch_node_composes >/dev/null 2>&1' || true
+assert_eq "node_compose_targets finds two distinct node compose files" "2" \
+  "$(wc -l < "$WORK/targets.txt" | tr -d ' ')"
+check "out-node compose file was patched" \
+  grep -q '/dev/net/tun:/dev/net/tun' "$WORK/nodeA/docker-compose.yml"
+check "main-node compose file was patched too" \
+  grep -q '/dev/net/tun:/dev/net/tun' "$WORK/nodeB/docker-compose.yml"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'

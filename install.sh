@@ -19,7 +19,7 @@ readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly BRANCH_DEFAULT="main"
 readonly BRANCH_FALLBACK="arena/01417195-warp-pasarguard"
-readonly VERSION="1.0.3"
+readonly VERSION="1.0.4"
 
 # When this file is streamed with `curl | bash -s`, BASH_SOURCE[0] is unset.
 # Keep a safe, empty default so `set -u` never aborts the installer.
