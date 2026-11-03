@@ -1,0 +1,22 @@
+# Runtime state produced by warp-manager on a server (never commit it)
+/opt/
+state.env
+profiles/
+outbound/
+backups/
+logs/
+bin/wgcf
+*.bak
+*.tmp
+
+# Local test artefacts
+.warp-test/
+tests/.tmp/
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

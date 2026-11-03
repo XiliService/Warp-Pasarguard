@@ -1,0 +1,140 @@
+# Troubleshooting
+
+All checks below are available through `warp-manager status` and
+`warp-manager logs`.
+
+## 1. SSH / server access lost after installing the kernel backend
+
+Symptom: the session freezes right after `systemctl restart wg-quick@warp`.
+
+Cause: `wg-quick` installed `0.0.0.0/0` into the main routing table because
+`Table = off` was missing. This is the warning in the official PasarGuard
+guide.
+
+Recovery through the datacenter console (VNC / IPMI / rescue shell):
+
+```bash
+sudo systemctl disable --now wg-quick@warp
+sudo ip route del 0.0.0.0/0 dev warp 2>/dev/null || true
+sudo grep -n 'Table' /etc/wireguard/warp.conf   # must say: Table = off
+```
+
+Prevention: this tool always writes `Table = off`, records the default route
+before setup, compares it afterwards, and rolls back automatically on any
+change or error. `warp-manager status` explicitly audits the flag.
+
+---
+
+## 2. `cdn-cgi/trace` still shows the real server IP
+
+Check in order:
+
+1. `warp-manager status` -> is the installation active, and which backend?
+2. Are you testing with a config that actually exits from the machine where
+   WARP was installed? `tunnel` configs exit on the foreign node; `direct`
+   configs exit in Iran. See `ARCHITECTURE.md`.
+3. `routing.rules`: is the WARP rule present and above other catch-all rules?
+4. `outbounds`: is the `warp` object present and is its tag spelled exactly
+   as in the rule?
+5. Xray backend: is `/dev/net/tun` exposed to the container, and was the
+   container **recreated** (`docker compose up -d`, not `restart`)?
+6. Kernel backend: `wg show warp latest-handshakes` should show a recent
+   epoch; `journalctl -u wg-quick@warp -n 100` shows handshake errors.
+7. UDP/2408 toward Cloudflare must be allowed by the host firewall and the
+   datacenter. Some providers rate-limit or block WARP endpoints.
+
+Verification command:
+
+```bash
+curl https://www.cloudflare.com/cdn-cgi/trace | grep -E '^(ip|loc|warp)='
+```
+
+Expected: `warp=on` (free) or `warp=plus` (WARP+), and a Cloudflare IP.
+
+---
+
+## 3. Xray reports errors for the WireGuard outbound
+
+| Message | Cause / fix |
+| --- | --- |
+| `failed to create virtual tun interface` | `/dev/net/tun` missing inside the container; apply the compose patch and recreate the container |
+| `invalid WireGuard secret key` | The key pasted into Core Settings is not the `PrivateKey` from `wgcf-profile.conf`; regenerate with `warp-manager install --force` |
+| `failed to dial to dest` | DNS resolution of `engage.cloudflareclient.com` failed inside Xray, or UDP/2408 blocked. Use a numeric endpoint: `--endpoint 162.159.192.1:2408` |
+| Memory growth over days | Xray older than 1.8.3; update Xray core (`pg-node core-update`) or switch to `--mode kernel` |
+| Unknown `noKernelTun` / `remoteDNS` keys | Old Xray ignores unknown keys; generated config is still valid. Omit `--modern-xray` |
+
+---
+
+## 4. `sendThrough` / per-IP binding does not change the source IP
+
+`sendThrough` is a general outbound field and Xray's WireGuard dialer honours
+it through `internet.DialSystem`, but some older builds do not. Diagnose:
+
+```bash
+tcpdump -ni eth0 'udp port 2408' -nn
+```
+
+You should see one source IP per WARP account. If all packets use the primary
+IP:
+
+- upgrade Xray (`pg-node core-update`);
+- or use `--mode kernel --binding per-ip`, which binds the source at the OS
+  level with a `PostUp` host route and distinct Cloudflare endpoints;
+- or fall back to `--binding single` and accept a single WARP egress.
+
+Kernel per-IP mode requires a reachable default gateway; the tool detects it
+and warns if the host route cannot be created.
+
+---
+
+## 5. `wgcf` problems
+
+| Message | Fix |
+| --- | --- |
+| `Could not download wgcf` | Server cannot reach `github.com` / release assets; download manually and place the binary at `/opt/pasarguard-warp/bin/wgcf`, then rerun `--force` |
+| `Checksum mismatch` | The download was corrupted or tampered with; the install aborts. Retry or set `--wgcf-version latest` |
+| `register` fails / rate limited | Cloudflare's registration API is throttling the IP; wait and retry, or register on another machine and copy `wgcf-account.toml` into the profile directory |
+| `warp=on` instead of `warp=plus` | Known Cloudflare bug for accounts that were previously connected. Register a fresh account, bind the license key, then generate immediately |
+| Account device limit | A WARP account supports 5 devices. Create extra profiles (`--binding per-ip`) or re-register |
+
+---
+
+## 6. Panel API problems
+
+| HTTP | Meaning |
+| --- | --- |
+| 401 | Wrong credentials or expired token. Check `PANEL_USER` / `PANEL_PASS` / `PANEL_TOKEN` |
+| 403 | Admin lacks `cores:read` or `cores:update` permission; use a sudo admin |
+| 404 | API docs disabled, wrong base URL, or a reverse-proxy path prefix. Use `--no-apply-panel` and paste the snippets manually |
+| 422 | The Core payload shape differs (custom panel build). The tool keeps the original snapshot; restore it from `backups/` |
+| TLS errors | Self-signed certificate: use `--insecure` (development only) |
+
+The tool always saves `panel-core-<id>-<timestamp>.json` before writing, and
+shows a diff summary with a confirmation prompt unless `--yes` is used.
+
+---
+
+## 7. Nothing happens for `cdn` / `direct` configs
+
+Expected. WARP on the foreign node only affects traffic that leaves from the
+foreign node. To cover `direct` configs, deploy WARP on the Iran server as a
+separate installation (`--target panel`), preferably with the Xray backend,
+and use a distinct tag (for example a separate Core config) so the two
+deployments do not fight over the `warp` tag.
+
+---
+
+## 8. Useful commands
+
+```bash
+sudo warp-manager status
+sudo warp-manager logs                 # log source submenu
+sudo warp-manager logs --follow --lines 200
+sudo journalctl -u wg-quick@warp -n 100 --no-pager
+sudo wg show
+sudo ip route show table main
+sudo docker compose -f /opt/pg-node/docker-compose.yml logs --tail=100 node
+sudo tcpdump -ni any 'udp port 2408' -nn
+sudo warp-manager install --force      # re-register accounts and regenerate JSON
+sudo warp-manager remove               # clean uninstall
+```
