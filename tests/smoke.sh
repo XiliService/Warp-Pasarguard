@@ -51,6 +51,8 @@ export PATH="$WORK/bin:$PATH"
 
 check "--help documents the apply command" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'apply       Push generated snippets'"
+check "--help documents the fix-compose command" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'fix-compose Re-detect'"
 apply_err="$(WARP_APP_DIR="$WORK/apply-app" bash "$ROOT/warp-manager.sh" apply --yes 2>&1 || true)"
 if printf '%s' "$apply_err" | grep -q 'Panel URL is required'; then
   ok "apply without a panel URL fails with a clear message"

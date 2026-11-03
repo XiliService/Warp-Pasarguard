@@ -1609,6 +1609,15 @@ TXT
   info "Run 'warp-manager logs' to inspect service output."
 }
 
+cmd_fix_compose() {
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - Fix Compose TUN Permissions"
+  is_installed || warn "WARP is not marked as installed; this only patches docker-compose.yml."
+  patch_compose
+  info "Done. Recreate the container if you declined the restart."
+  return 0
+}
+
 cmd_apply() {
   local action="${1:-apply}"
   state_init
@@ -2008,6 +2017,7 @@ Commands:
   menu        Open the interactive menu
   apply       Push generated snippets into the panel API (no reinstall)
   unapply     Remove WARP outbound/rules from the panel API
+  fix-compose Re-detect and patch the NODE compose service for TUN access
   help        Show this help
 
 Install options:
@@ -2068,7 +2078,7 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose) COMMAND="$1"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -2157,6 +2167,7 @@ main() {
     status)    cmd_status ;;
     apply)     require_root; cmd_apply apply ;;
     unapply)   require_root; cmd_apply remove ;;
+    fix-compose) require_root; cmd_fix_compose ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac
