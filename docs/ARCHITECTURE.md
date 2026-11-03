@@ -40,24 +40,43 @@ This document explains the decision that the installer asks you to make in
                         (Google, OpenAI, Spotify, ...)
 ```
 
-The important consequence: **the Core Settings JSON is authored on the Iran
-panel, but it is executed by Xray on the foreign server.** A WireGuard WARP
-outbound therefore makes its UDP connection to Cloudflare from the foreign
-server, not from Iran.
+## 2.1 The two Core configs (confirmed from a real deployment)
 
-## 3. Decision table
+There are **two Core configs**, and they are not interchangeable:
+
+| | IRAN main panel core | FOREIGN relay core |
+| --- | --- | --- |
+| Inbounds | 12, one per config category (`[DE] - CloudFlare - CDN`, `[DE] - DC - Reality`, `[DE] - Tunnel - ArvanCloud`, ...) | 4: `Germany`, `NetherLands`, `Poland`, `SOCKS5` |
+| Outbounds | `DIRECT`, `Germany`, `NetherLands`, `Poland` (vless to the foreign inbounds), `BLOCK` | `DIRECT`, `Out-DE`, `Out-NL`, `Out-PL` (freedom bound to the 3 IPs), `BLOCK` |
+| Routing | maps each **inbound tag** to a location outbound | maps each of the 3 location inbounds to an IP outbound |
+
+All 12 user configs are merged into just **3 inbounds** by the time they reach
+the foreign relay. Therefore the foreign core **cannot tell a `tunnel` config
+from a `cdn` or `direct` config**. Any WARP rule added there captures every
+user, which is exactly why every config drops when WARP is applied on the
+foreign server.
+
+## 3. Decision table (corrected)
 
 | Goal | Run `warp-manager` on | Backend | Notes |
 | --- | --- | --- | --- |
-| Cover `tunnel` configs (recommended) | **Foreign node** | `xray` | Panel pushes the outbound automatically; patch the node container's `docker-compose.yml` for TUN |
-| Cover `tunnel` configs, Xray too old for WireGuard outbound | **Foreign node** | `kernel` | `/etc/wireguard/warp.conf` must exist on the node as well (official guide: repeat step 3 on the node) |
-| Cover `direct` configs | Iran main panel server | `xray` | Riskier host: it carries the dashboard and all users |
-| Cover `cdn` configs | Usually the origin behind the CDN | `xray` | WARP changes only the leg that actually leaves that machine |
+| Cover **only `tunnel` configs** (recommended) | **IRAN main panel server** | `xray` | The script finds the `... Tunnel ...` inbound tags and scopes the WARP rule to them. All other configs keep their foreign IP. |
+| Cover `direct` configs | IRAN main panel server | `xray` | Same core, different inbound tags |
+| Cover `cdn` configs | IRAN main panel server | `xray` | Same core, different inbound tags |
 | Only produce JSON snippets | Any machine (or a laptop) | any | `--target generator --dry-run`, no host changes |
 
-Running the script on the Iran panel and expecting the `tunnel` configs to use
-WARP is the most common mistake. The Iran Xray process forwards those
-connections to the node; it does not open the final socket.
+**Answer to "which server?": the IRAN server.** All users, hosts and the 12
+inbounds live there; the foreign server is only an egress relay for the three
+IPs and must stay untouched. `warp-manager apply` now *refuses* to modify a
+Core config that has no `tunnel` inbound (a shared egress relay) unless
+`--all-traffic` is passed explicitly.
+
+The earlier "foreign node" advice assumed a single gRPC node link where the
+Iran panel authors the Core config pushed to the foreign Xray. The real
+deployment uses a vless chain between two Core configs, so the WARP decision
+must be made on the Iran side where the categories are still distinguishable.
+WARP then exits from Cloudflare via the Iran node; `cdn` / `direct` configs
+continue to use the three foreign IPs.
 
 ## 4. What each backend changes
 

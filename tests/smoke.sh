@@ -1007,6 +1007,68 @@ check "post-apply health check detects a node in error state" \
   bash -c '[[ "$1" == "3|1" ]]' _ "$health"
 
 # ---------------------------------------------------------------------------
+printf '\n[8m] Main-panel only: WARP must be scoped to tunnel inbounds\n'
+cat >"$WORK/iran-core.json" <<'JSON'
+{
+  "id": 1, "name": "Default Core Config", "type": "xray",
+  "exclude_inbound_tags": [], "fallbacks_inbound_tags": [],
+  "config": {
+    "inbounds": [
+      {"tag": "[DE] - CloudFlare - CDN", "protocol": "vless"},
+      {"tag": "[DE] - Tunnel - ArvanCloud", "protocol": "vless"},
+      {"tag": "[NL] - Tunnel - ArvanCloud", "protocol": "vless"}
+    ],
+    "outbounds": [
+      {"tag": "DIRECT", "protocol": "freedom"},
+      {"tag": "Germany", "protocol": "vless"},
+      {"tag": "BLOCK", "protocol": "blackhole"}
+    ],
+    "routing": {"rules": [
+      {"type": "field", "outboundTag": "BLOCK", "ip": ["geoip:private"]},
+      {"type": "field", "inboundTag": ["[DE] - CloudFlare - CDN"], "outboundTag": "Germany"}
+    ]}
+  }
+}
+JSON
+cat >"$WORK/no-tunnel-core.json" <<'JSON'
+{"id":1,"name":"foreign-node","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],
+ "config":{"inbounds":[{"tag":"Germany","protocol":"vless"},{"tag":"NetherLands","protocol":"vless"},{"tag":"Poland","protocol":"vless"}],
+ "outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Out-DE","protocol":"freedom"},{"tag":"BLOCK","protocol":"blackhole"}],
+ "routing":{"rules":[{"type":"field","outboundTag":"BLOCK"}]}}}
+JSON
+printf '%s\n' '["[DE] - Tunnel - ArvanCloud","[NL] - Tunnel - ArvanCloud"]' >"$WORK/tunnel-tags.json"
+scoped="$(WARP_APP_DIR="$WORK/scoped-app" TAGS_FILE="$WORK/tunnel-tags.json" \
+  WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  WARP_TUNNEL_TAGS="$(cat "$TAGS_FILE")"
+  MODE="xray"; ROUTING="domains"; RULE_PREPEND=0; MODERN_XRAY=1
+  profile_meta_set demo PRIVATE_KEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  profile_meta_set demo ADDRESS4 "172.16.0.2/32"
+  profile_meta_set demo ADDRESS6 ""
+  profile_meta_set demo PUBLIC_KEY "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo="
+  profile_meta_set demo ENDPOINT "engage.cloudflareclient.com:2408"
+  profile_meta_set demo TAG "warp"
+  build_snippets demo >/dev/null 2>&1
+  merge_core_config "$1" "$2" apply
+  jq -c ".routing.rules[1]" "$2"' _ "$WORK/iran-core.json" "$WORK/scoped-out.json" 2>/dev/null || true)"
+check "WARP rule is scoped to the tunnel inbounds on the main panel core" \
+  bash -c 'printf %s "$1" | grep -q inboundTag && printf %s "$1" | grep -q warp' _ "$scoped"
+check "scoped WARP rule drops the global domain catch-all" \
+  bash -c '! printf %s "$1" | grep -q domain' _ "$scoped"
+assert_eq "BLOCK rule stays above the WARP rule" "BLOCK" \
+  "$(jq -r '.routing.rules[0].outboundTag' "$WORK/scoped-out.json" 2>/dev/null)"
+guard="$(WARP_APP_DIR="$WORK/guard-app" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  PANEL_API_KEY="pg_key_test"; PANEL_CORE_ID="1"; PANEL_URL="http://127.0.0.1:8000"
+  panel_login() { return 0; }
+  panel_api() { PANEL_API_BODY="$(cat "$1")"; return 0; }
+  apply_to_panel apply 2>&1 || true' _ "$WORK/no-tunnel-core.json" 2>/dev/null || true)"
+check "apply refuses a shared egress core with no tunnel inbound" \
+  bash -c '[[ "$1" == *"shared egress relay"* ]]' _ "$guard"
+check "--all-traffic is documented" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--all-traffic'"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \

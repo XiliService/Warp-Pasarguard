@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.12"
+readonly SCRIPT_VERSION="1.0.13"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -90,6 +90,8 @@ LOG_LINES=80
 LOG_FOLLOW=0
 MODERN_XRAY=1
 REMOVE_ALL=0
+ALL_TRAFFIC=0
+WARP_TUNNEL_TAGS="[]"
 BINDING_PRESET="${WARP_BINDING:+1}"
 BINDING_PRESET="${BINDING_PRESET:-0}"
 
@@ -1812,6 +1814,7 @@ merge_core_config() {
      --slurpfile rules "$OUTPUT_DIR/routing-rules.json" \
      --slurpfile bals "$OUTPUT_DIR/balancers.json" \
      --argjson prepend "$prepend" \
+     --argjson tunnel "$WARP_TUNNEL_TAGS" \
      --argjson apply "$([[ "$action" == "apply" ]] && echo 1 || echo 0)" \
      '
      def ours: (.tag // "") | test("^warp(-|$)");
@@ -1843,7 +1846,14 @@ merge_core_config() {
          | ([ range(0; ($r|length)) as $i
               | select(($r[$i] | is_block_rule) | not) | $i ]
             | min // ($r|length)) as $rcut
-         | .routing.rules = ($r[0:$rcut] + $rules[0] + $r[$rcut:])
+         # On the MAIN PANEL core, scope WARP to the "tunnel" inbounds only.
+         # On an egress relay all configs share 3 inbounds, so a domain rule
+         # would silently capture every user.
+         | .routing.rules = ($r[0:$rcut]
+             + (if ($tunnel | length) > 0 then
+                  [ ($rules[0][0] | del(.domain) + { inboundTag: $tunnel }) ]
+                else $rules[0] end)
+             + $r[$rcut:])
          | .routing.balancers = (.routing.balancers + $bals[0])
          | if (.routing.balancers | length) == 0 then del(.routing.balancers) else . end
        else . end
@@ -1922,6 +1932,28 @@ apply_to_panel() {
   printf '%s\n' "$PANEL_API_BODY" | jq . >"$snapshot"
   chmod 600 "$snapshot"
   info "Panel core backup saved: ${snapshot}"
+
+  # The WARP decision must be made where the user inbounds live. On the main
+  # panel those are named "... Tunnel ..."; on an egress relay (Germany /
+  # NetherLands / Poland / SOCKS5) all configs are merged into 3 inbounds and
+  # a WARP rule there affects EVERY user.
+  WARP_TUNNEL_TAGS="$(jq -c '[ (.config.inbounds // [])[] | .tag // empty
+        | select(ascii_downcase | test("tunnel")) ]' "$snapshot" 2>/dev/null || echo '[]')"
+  [[ -n "$WARP_TUNNEL_TAGS" ]] || WARP_TUNNEL_TAGS="[]"
+  if [[ "$action" == "apply" ]]; then
+    if [[ "$WARP_TUNNEL_TAGS" != "[]" ]]; then
+      info "Found tunnel inbounds on this Core: ${WARP_TUNNEL_TAGS}. WARP applies ONLY to them."
+    elif [[ "$ALL_TRAFFIC" == "1" ]]; then
+      warn "No tunnel inbounds on this Core; --all-traffic applies WARP to all users."
+    else
+      error "This Core config has NO 'tunnel' inbound: it is a shared egress relay."
+      error "Adding WARP here affects every config, because all users are merged into these inbounds."
+      error "Run warp-manager on the MAIN PANEL server (where your users and inbounds are) instead."
+      warn "See docs/ARCHITECTURE.md. Override only if you really want all traffic: --all-traffic"
+      rm -f -- "$snapshot"
+      return 1
+    fi
+  fi
 
   local merged
   merged="$(mktemp)"
@@ -3270,6 +3302,10 @@ Commands:
   key         Create/reuse the dedicated Panel API key
   help        Show this help
 
+Server selection: install on the MAIN PANEL server (Iran), where the user
+  inbounds live. Do NOT install on a shared egress relay: apply refuses it.
+  See docs/ARCHITECTURE.md section 2.1.
+
 Install options:
   --mode xray|kernel        WARP backend (default: asked interactively)
   --target exit|panel|generator
@@ -3285,6 +3321,7 @@ Install options:
   --wgcf-version TAG|latest wgcf release tag (default: v2.2.22)
   --modern-xray             Use userspace WireGuard (default; safe inside Docker)
   --legacy-xray            Use legacy kernelMode/DNS fields (old Xray only)
+  --all-traffic            Allow WARP on a shared egress core (NOT recommended)
 
 Panel API options (optional):
   --panel-url URL           Panel base URL, e.g. https://panel.example.com
@@ -3353,6 +3390,7 @@ parse_args() {
       --wgcf-version) WGCF_VERSION="$2"; shift 2 ;;
       --modern-xray) MODERN_XRAY=1; shift ;;
       --legacy-xray) MODERN_XRAY=0; shift ;;
+      --all-traffic) ALL_TRAFFIC=1; shift ;;
       --panel-url) PANEL_URL="$2"; shift 2 ;;
       --panel-user) PANEL_USER="$2"; shift 2 ;;
       --panel-pass) PANEL_PASS="$2"; shift 2 ;;
