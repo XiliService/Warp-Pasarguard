@@ -100,7 +100,7 @@ OS_ID="unknown"; OS_VER="unknown"; ARCH="unknown"; KERNEL="unknown"
 WGCF_ARCH="amd64"; DETECTED_ROLE="unknown"
 PRIMARY_IP=""; DEFAULT_ROUTE=""; DEFAULT_GW=""; DEFAULT_DEV=""
 XRAY_VERSION="unknown"; COMPOSE_SERVICES=""
-COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""
+COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""; PANEL_APPLY_OK=0
 ROUTE_GUARD=0
 ROUTE_BEFORE=""
 COMPOSE_FILE=""
@@ -1191,6 +1191,7 @@ merge_core_config() {
 
 apply_to_panel() {
   local action="${1:-apply}"
+  PANEL_APPLY_OK=0
   [[ -n "$PANEL_URL" ]] || { warn "Panel URL not configured; skipping API apply."; return 0; }
   have jq || die "jq is required for panel API integration."
   panel_login || { warn "Could not authenticate. Panel snippets are still available for manual paste."; return 0; }
@@ -1255,6 +1256,7 @@ apply_to_panel() {
     return 1
   }
   ok "Core config ${core_id} updated and nodes notified."
+  PANEL_APPLY_OK=1
   state_set_many "PANEL_CORE_ID=$core_id" "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PANEL_LAST_BACKUP=$snapshot"
   cp -f -- "$merged" "$OUTPUT_DIR/core-config-preview.json"
   rm -f -- "$merged"
@@ -1637,6 +1639,8 @@ cmd_apply() {
     info "Removing the WARP outbound/rules from the panel Core Settings."
   fi
   apply_to_panel "$action"
+  [[ "$PANEL_APPLY_OK" == "1" ]] || die \
+    "Panel config was NOT applied. Read the error above, or paste the snippets manually (see ${OUTPUT_DIR}/README.txt)."
   info "Done. Verify with: warp-manager status"
   return 0
 }
