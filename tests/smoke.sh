@@ -95,6 +95,60 @@ check "dry-run makes no changes" bash -c "printf '%s' \"\$1\" | grep -q 'No chan
 check "dry-run created no wgcf binary" test ! -e "$WORK/plan-app/bin/wgcf"
 
 # ---------------------------------------------------------------------------
+printf '\n[5b] Full interactive wizard with empty optional answers\n'
+cat >"$WORK/wizard.sh" <<'EOF'
+source "$WARP_MANAGER"
+DETECTED_IPS=("203.0.113.10" "203.0.113.11" "203.0.113.12")
+DETECTED_IFACES=("eth0" "eth0" "eth0")
+DETECTED_ROLE="node"
+ASSUME_YES=0
+BINDING_PRESET=0
+choose_target >/dev/null 2>&1
+choose_mode >/dev/null 2>&1
+choose_binding >/dev/null 2>&1
+choose_routing >/dev/null 2>&1
+choose_optional >/dev/null 2>&1
+install_plan >/dev/null 2>&1
+printf 'WIZARD_OK target=%s mode=%s binding=%s routing=%s' \
+  "$TARGET" "$MODE" "$BINDING" "$ROUTING"
+EOF
+wizard_out="$(printf '1\n1\n1\n1\n\n\n\n\n' \
+  | WARP_APP_DIR="$WORK/wizard-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+    bash "$WORK/wizard.sh" 2>/dev/null || true)"
+check "wizard survives empty Enter answers (set -e regression)" \
+  bash -c "printf '%s' "\$1" | grep -q 'WIZARD_OK'" _ "$wizard_out"
+assert_eq "wizard keeps the documented defaults" \
+  "WIZARD_OK target=exit mode=xray binding=single routing=domains" "$wizard_out"
+
+# Role detection should trust running containers, not merely leftover folders.
+mkdir -p "$WORK/fakebin"
+cat >"$WORK/fakebin/docker" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "ps" && "${2:-}" == "--format" ]]; then
+  case "$3" in
+    *Image*) printf 'pasarguard/node:latest\n' ;;
+    *Names*) printf 'pg-node\n' ;;
+  esac
+  exit 0
+fi
+if [[ "${1:-}" == "exec" ]]; then printf 'Xray 25.9.11\n'; exit 0; fi
+exit 0
+EOF
+chmod +x "$WORK/fakebin/docker"
+role_out="$(WARP_APP_DIR="$WORK/role-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    detect_role
+    printf "%s" "$DETECTED_ROLE"' 2>/dev/null || true)"
+assert_eq "detect_role identifies a node container" "node" "$role_out"
+xray_out="$(WARP_APP_DIR="$WORK/role-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    detect_xray_version
+    printf "%s" "$XRAY_VERSION"' 2>/dev/null || true)"
+assert_eq "detect_xray_version discovers any container name" "25.9.11" "$xray_out"
+
+# ---------------------------------------------------------------------------
 printf '\n[6] Function-level tests (sourced, no main)\n'
 export WARP_APP_DIR="$WORK/unit-app"
 # shellcheck disable=SC1090

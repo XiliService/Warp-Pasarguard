@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.2"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -393,14 +393,25 @@ detect_os() {
 }
 
 detect_role() {
-  local role="unknown"
-  if [[ -f /opt/pasarguard/docker-compose.yml || -d /var/lib/pasarguard ]]; then
-    role="panel"
+  local role="unknown" panel=0 node=0 images="" line
+  if have docker; then
+    images="$(docker ps --format '{{.Image}}' 2>/dev/null || true)"
+    while IFS= read -r line; do
+      case "$line" in
+        *pasarguard/panel*|*pasarguard-panel*) panel=1 ;;
+        *pasarguard/node*|*pg-node*) node=1 ;;
+      esac
+    done <<<"$images"
   fi
-  if [[ -f /opt/pg-node/docker-compose.yml || -d /var/lib/pg-node ]]; then
-    if [[ "$role" == "panel" ]]; then role="panel+node"; else role="node"; fi
+  if [[ -f /opt/pasarguard/docker-compose.yml ]]; then panel=1; fi
+  if [[ -f /var/lib/pasarguard/xray_config.json && "$node" -eq 0 ]]; then panel=1; fi
+  if [[ -f /opt/pg-node/docker-compose.yml || -d /var/lib/pg-node ]]; then node=1; fi
+  if (( panel == 1 && node == 1 )); then role="panel+node"
+  elif (( node == 1 )); then role="node"
+  elif (( panel == 1 )); then role="panel"
   fi
   DETECTED_ROLE="$role"
+  return 0
 }
 
 detect_ips() {
@@ -454,7 +465,7 @@ detect_compose() {
 }
 
 compose_services() {
-  [[ -n "$COMPOSE_FILE" ]] || { COMPOSE_SERVICES=""; return 1; }
+  [[ -n "$COMPOSE_FILE" ]] || { COMPOSE_SERVICES=""; return 0; }
   COMPOSE_SERVICES="$(python3 - "$COMPOSE_FILE" <<'PY'
 import re, sys
 path = sys.argv[1]
@@ -486,14 +497,21 @@ PY
 }
 
 detect_xray_version() {
-  local v=""
+  local v="" name
+  local -a containers=()
   if have docker; then
-    v="$(docker exec pg-node xray version 2>/dev/null | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-    [[ -z "$v" ]] && v="$(docker exec pasarguard xray version 2>/dev/null | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    while IFS= read -r name; do
+      [[ -n "$name" ]] && containers+=("$name")
+    done < <(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    for name in "${containers[@]}"; do
+      v="$(docker exec "$name" xray version 2>/dev/null | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+      [[ -n "$v" ]] && break
+    done
   fi
   [[ -z "$v" ]] && have xray && v="$(xray version 2>/dev/null | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
   [[ -z "$v" ]] && v="$(find /var/lib/pg-node /var/lib/pasarguard /usr/local/bin -maxdepth 3 -name 'xray' -type f -perm -u+x 2>/dev/null | head -n1 | xargs -r -I{} {} version 2>/dev/null | grep -oiE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
   XRAY_VERSION="${v:-unknown}"
+  return 0
 }
 
 # -----------------------------------------------------------------------------
@@ -1215,6 +1233,7 @@ print_target_guidance() {
     interface MUST also exist on the node.
 TXT
   line
+  return 0
 }
 
 choose_target() {
@@ -1232,9 +1251,11 @@ choose_target() {
     warn "This host looks like a NODE, but you selected MAIN PANEL. Double-check."
   fi
   if [[ "$TARGET" == "exit" && "$DETECTED_ROLE" == "panel" ]]; then
-    warn "This host looks like the MAIN PANEL, but you selected EXIT NODE."
-    warn "Kernel WireGuard here will NOT affect configs that exit on the foreign node."
+    warn "Detected role is 'panel' on this host, but you selected EXIT NODE."
+    warn "Please confirm that THIS machine is where tunnelled traffic leaves to the Internet."
+    warn "If this is only the Iran main panel, abort (Ctrl+C) and run the script on the foreign node."
   fi
+  return 0
 }
 
 choose_mode() {
@@ -1264,6 +1285,7 @@ TXT
       info "Detected Xray version: ${XRAY_VERSION}"
     fi
   fi
+  return 0
 }
 
 choose_binding() {
@@ -1328,6 +1350,7 @@ TXT
     SRC_IP="${DETECTED_IPS[$((pick - 1))]}"
   fi
   is_valid_ipv4 "$SRC_IP" || die "Invalid IPv4 address: ${SRC_IP}"
+  return 0
 }
 
 normalize_perip() {
@@ -1349,6 +1372,7 @@ normalize_perip() {
   for i in "${!PERIP_LABELS[@]}"; do
     PERIP_LABELS[$i]="$(safe_name "${PERIP_LABELS[$i]}")"
   done
+  return 0
 }
 
 apply_defaults() {
@@ -1363,6 +1387,7 @@ apply_defaults() {
     for i in "${!DETECTED_IPS[@]}"; do PERIP_LABELS+=("loc$((i + 1))"); done
   fi
   [[ -n "$DOMAINS_CSV" ]] || DOMAINS_CSV="$DEFAULT_DOMAINS"
+  return 0
 }
 
 choose_routing() {
@@ -1377,7 +1402,10 @@ choose_routing() {
     [[ -n "$ans" ]] && DOMAINS_CSV="$ans"
   fi
   RULE_PREPEND=1
-  [[ "$ROUTING" == "all" ]] && info "WARP outbound will be placed first in the outbounds array."
+  if [[ "$ROUTING" == "all" ]]; then
+    info "WARP outbound will be placed first in the outbounds array."
+  fi
+  return 0
 }
 
 choose_optional() {
@@ -1388,8 +1416,9 @@ choose_optional() {
   [[ -n "$ans" ]] && ENDPOINT="$ans"
   if [[ -z "$PANEL_URL" ]]; then
     ans="$(ui_read "Panel API base URL to auto-apply config (optional, e.g. https://panel.example.com): ")" || return 1
-    [[ -n "$ans" ]] && PANEL_URL="$ans"
+    if [[ -n "$ans" ]]; then PANEL_URL="$ans"; fi
   fi
+  return 0
 }
 
 install_plan() {
@@ -1410,6 +1439,7 @@ install_plan() {
     printf '  %-22s %s\n' "Profile" "${LABEL:-default} / src=${SRC_IP:-system default}"
   fi
   line
+  return 0
 }
 
 cmd_install() {
@@ -1719,6 +1749,7 @@ cmd_logs() {
       done ;;
     *) return 0 ;;
   esac
+  return 0
 }
 
 # -----------------------------------------------------------------------------
