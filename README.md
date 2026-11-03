@@ -13,6 +13,7 @@ All script output, menus, logs, generated configs and documentation are in
 
 ## Table of contents
 
+0. [TWO SERVERS ARE REQUIRED](docs/TWO-SERVERS.md) - full per-server commands
 1. [Which server should run this script?](#1-which-server-should-run-this-script)
 2. [Your topology, mapped to WARP](#2-your-topology-mapped-to-warp)
 3. [Quick start](#3-quick-start)
@@ -32,124 +33,131 @@ All script output, menus, logs, generated configs and documentation are in
 
 ## 1. Which server should run this script?
 
-**This is the single most important question.** WARP must be applied at the
-point where the traffic **leaves the server toward the Internet** (the egress /
-exit point). It is *not* necessarily the server that holds the users, and it is
-*not* necessarily the server that hosts the panel database.
+**BOTH servers. The script must be installed and run on BOTH servers.** This
+overrides all earlier "foreign server only" or "Iran server only" advice. The
+full command list for each server is in **[docs/TWO-SERVERS.md](docs/TWO-SERVERS.md)**.
 
 ```
-[ Clients ]
-    |
-    v
-[ IRAN : MAIN PANEL ]  ---- node / tunnel link ---->  [ FOREIGN NODE : NL / DE / PL ]
-  users, configs,                                      3 public IPs, 3 location outbounds
-  Core Settings, DB                                   |
-                                                       v
-                                                  PUBLIC INTERNET
-                                                  ^^^ WARP belongs HERE
+[ Clients ] -> [ IRAN : MAIN PANEL ]  --TCP-->  [ FOREIGN relay ] --WARP--> Internet
+                12 user inbounds                 WARP-LINK inbound
+                WARP-DEDICATED inbound          warp outbound + rule
+                WARP-LINK outbound
 ```
 
-| Config type in your panel | Where the traffic exits | Where WARP must take effect |
-| --- | --- | --- |
-| `tunnel` (Iran -> foreign node -> Internet) | **Foreign node (NL/DE/PL)** | **Foreign node** |
-| `direct` (Iran -> Internet) | Iran server | Iran server (only if you want to cover it) |
-| `cdn` (Iran -> CDN edge -> Internet) | CDN edge / foreign origin | WARP on the foreign node has a limited effect; WARP on the Iran server changes only the Iran leg |
+* **FOREIGN relay server** - WARP terminates here (`WARP-LINK` SOCKS inbound,
+  userspace `warp` outbound, one scoped rule). Cloudflare WARP is filtered on
+  Iranian hosts, so no WARP packet ever leaves Iran.
+* **IRAN MAIN PANEL server** - all 12 user inbounds live here. One dedicated
+  `WARP-DEDICATED` inbound (a clone of a real VLESS/Reality inbound) is the
+  ONLY config routed to WARP, through a `WARP-LINK` SOCKS outbound.
 
-### Practical answer for this setup
+**Deleting the WARP inbound / outbound / routing rule on the FOREIGN server
+cuts the WARP config on Iran.** Do not test by deleting: run
+`sudo warp-manager warp-check` on BOTH servers. To repair, run
+`sudo warp-manager repair --yes` on the FOREIGN server FIRST, then on the IRAN
+server. Menu option 1 (`Install / Repair WARP`) does the same automatically and
+never just stops.
 
-- For your **`tunnel` configs, run the script on the FOREIGN server**
-  (the one with the three IPs). That is the machine whose Xray process
-  actually opens the connection to Google / OpenAI / Spotify.
-- The **Core Settings JSON lives on the MAIN panel in Iran**, but it is
-  *executed* by the node. This is why the official guide says:
-  - *Xray WireGuard backend*: no changes are needed on the node, the panel
-    pushes the outbound automatically. The node container still needs
-    `/dev/net/tun` access, which this tool patches in its `docker-compose.yml`.
-  - *Kernel WireGuard backend (`wg-quick`)*: step 3 must be repeated **on the
-    node**, i.e. the `/etc/wireguard/warp.conf` interface must exist on the
-    foreign server too.
-- Running the script **only on the Iran panel** will not change anything for
-  the `tunnel` configs, because those connections never originate from Iran.
-- Running the kernel backend on the Iran server is possible, but that server
-  hosts the main panel and all users, so prefer the Xray backend there, or
-  leave it alone.
+### Install on BOTH servers (one time)
 
-The installer prints this guidance on screen and asks you to pick the target
-(`exit`, `panel`, or `generator`). `generator` only produces the panel JSON
-snippets and touches nothing on the host.
+```bash
+curl -fsSL -H 'Accept: application/vnd.github.raw' 'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' | sudo bash -s -- --branch arena/01417195-warp-pasarguard
+sudo warp-manager
+```
+
+### FOREIGN relay server - commands
+
+```bash
+sudo warp-manager update --yes
+sudo warp-manager                    # menu option 1
+sudo warp-manager warp-link --yes
+sudo warp-manager warp-link --show    # reprint the WARPLINK1 line
+sudo warp-manager warp-check
+sudo warp-manager status
+```
+
+### IRAN MAIN PANEL server - commands
+
+```bash
+sudo warp-manager update --yes
+sudo warp-manager                    # menu option 1
+sudo warp-manager warp-inbound 'WARPLINK1:...' --yes   # first time only
+sudo warp-manager warp-check
+sudo warp-manager status
+```
+
+Then create the Host in the Panel: `Hosts -> Add Host -> Inbound tag:
+WARP-DEDICATED`, address = Iran IP, port = the port printed by `warp-inbound`.
+Only that config works in v2rayNG / v2rayN and uses WARP.
+
+### Repair (anything was deleted) - FOREIGN first
+
+```bash
+# FOREIGN server
+sudo warp-manager update --yes && sudo warp-manager repair --yes
+# IRAN server
+sudo warp-manager update --yes && sudo warp-manager repair --yes
+# BOTH servers
+sudo warp-manager warp-check
+```
+
+No reinstall, no remove, no paste: saved link credentials in `state.env` are
+reused. Each server also gets `/opt/pasarguard-warp/SERVER-GUIDE.md` with these
+commands locally.
 
 ---
 
 ## 2. Your topology, mapped to WARP
 
-You have one foreign server with three public IPs geolocated in the
-Netherlands, Germany and Poland, three matching outbounds in the panel, and an
-Iran main panel connected to that server through a node (your "tunnel").
+The Iran main panel holds all 12 user inbounds (`[DE/NL/PL] - CloudFlare - CDN`,
+`[DE/NL/PL] - DC - Reality`, `[DE/NL/PL] - Tunnel - ArvanCloud`) and three
+vless outbounds (`Germany`, `NetherLands`, `Poland`). The foreign relay is only
+an outbound relay: its Core config has `Germany`, `NetherLands`, `Poland`,
+`SOCKS5` inbounds and `Out-DE`, `Out-NL`, `Out-PL` freedom outbounds. Because
+all 12 user configs merge into those three location inbounds, a global WARP
+rule on the foreign relay would capture **every** user. A local WARP WireGuard
+outbound on the Iran Core breaks the `tunnel` configs.
 
-Recommended deployment:
+The dedicated WARP link solves both: WARP stays on the foreign relay, and only
+the new `WARP-DEDICATED` inbound on Iran is routed to it. `cdn` / `direct` /
+`tunnel` keep their original rules and the three foreign IPs. Outbound order on
+both sides is `DIRECT -> ... -> warp / WARP-LINK -> BLOCK`, and the leading
+`BLOCK` routing rule stays above the WARP rule.
 
-```
-Foreign server (NL/DE/PL)          Iran server (MAIN PANEL)
---------------------------------  ---------------------------------------
-warp-manager install                (nothing to install for tunnel configs)
-  --mode xray                      Core Settings <- paste/apply generated JSON
-  --target exit                    Panel API <- optional auto-apply
-  --binding per-ip                 Users: cdn / direct / tunnel configs
-docker-compose.yml patched
-Xray outbound warp-nl / warp-de / warp-pl
-```
-
-With `--binding per-ip` the tool creates one WARP account per source IP and
-sets Xray's `sendThrough` to that IP, so each tunnel leaves from its own
-address. Cloudflare then selects the nearest point of presence for each source,
-which keeps the three locations meaningful instead of collapsing them into a
-single WARP egress. See [section 6](#6-multi-ip--multi-location-nl-de-pl).
-
-A WARP account allows a maximum of **5 simultaneous devices** (official docs).
-One account per IP plus a spare account is a good pattern for busy panels.
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) section 2.1 and
+[docs/TWO-SERVERS.md](docs/TWO-SERVERS.md).
 
 ---
 
 ## 3. Quick start
 
-```bash
-# One-line bootstrap (installs /usr/local/bin/warp-manager)
-curl -fsSL "https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/main/install.sh?v=$RANDOM" | sudo bash
-
-# Or from a local clone
-sudo ./install.sh
-
-# Open the numbered menu
-sudo warp-manager
-```
-
-The bootstrap verifies the downloaded script with `bash -n` before installing
-it, and keeps a copy in `/opt/pasarguard-warp/`.
-
-If `main` is not yet available (for example while working on a feature
-branch):
-
-```bash
-curl -fsSL "https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/arena/01417195-warp-pasarguard/install.sh?v=$RANDOM" \
-  | sudo bash -s -- --branch arena/01417195-warp-pasarguard
-# or install fully offline from a clone:
-sudo ./install.sh --local ./warp-manager.sh --no-menu
-```
-
-`raw.githubusercontent.com` is CDN-cached for a few minutes after a push. For
-a guaranteed-fresh copy use the GitHub API raw endpoint instead (no auth
-needed for a public repo):
+**Run the bootstrap on BOTH servers** (FOREIGN relay and IRAN main panel):
 
 ```bash
 curl -fsSL -H 'Accept: application/vnd.github.raw' \
   'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' \
   | sudo bash -s -- --branch arena/01417195-warp-pasarguard
+sudo warp-manager
 ```
 
-The installer itself tries `api.github.com` first (never CDN-cached), then the
-raw CDN mirrors, and adds a cache-buster to every URL. `install.sh` works both
-from a file and when streamed with `curl | bash -s` (where `BASH_SOURCE[0]` is
-unset).
+The bootstrap verifies the downloaded script with `bash -n` before installing
+it, installs `/usr/local/bin/warp-manager` and keeps a copy in
+`/opt/pasarguard-warp/`. Then choose **1) Install / Repair WARP** on each
+server - FOREIGN first. See [docs/TWO-SERVERS.md](docs/TWO-SERVERS.md) for the
+exact command list per server.
+
+Offline install from a local clone (also on both servers):
+
+```bash
+sudo ./install.sh --local ./warp-manager.sh --no-menu
+```
+
+`install.sh` works both from a file and when streamed with `curl | bash -s`
+(where `BASH_SOURCE[0]` is unset). The installer tries `api.github.com` first
+(never CDN-cached), then the raw CDN mirrors, and adds a cache-buster to every
+URL. `raw.githubusercontent.com` can be stale for a few minutes after a push,
+so prefer the API endpoint above. The `main` branch does not carry the script
+yet; always pass `--branch arena/01417195-warp-pasarguard`.
 
 ---
 
@@ -157,7 +165,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.18
+  PasarGuard WARP Manager  v1.0.19
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -167,7 +175,7 @@ unset).
 ------------------------------------------------------------------------
 
 Main menu - select an option:
-  1) Install / Configure WARP
+  1) Install / Repair WARP
   2) Remove / Uninstall WARP
   3) Update Script
   4) View Logs
@@ -177,15 +185,24 @@ Main menu - select an option:
 
 | # | Option | What it does |
 | --- | --- | --- |
-| 1 | Install / Configure WARP | Wizard: target, backend, IP binding, routing scope, license key, endpoint; installs `wgcf`, registers WARP account(s), writes `/etc/wireguard` or patches Docker, generates panel JSON, optionally applies it via API |
+| 1 | Install / Repair WARP | On a fresh server: full install wizard. On a server that already has state: **REPAIRS** the dedicated two-server WARP setup instead of stopping or asking for `--force`. Run it on BOTH servers. |
 | 2 | Remove / Uninstall WARP | Stops interfaces, restores `docker-compose.yml` from backup, removes WARP outbound/rules from the panel via API (if configured), deletes local profiles |
 | 3 | Update Script | Downloads the newest `warp-manager.sh`, validates syntax, backs up the old one, installs atomically (`--check` only compares) |
 | 4 | View Logs | Manager log, live log, `journalctl` for `wg-quick@*`, Docker compose logs, `wgcf status`, generated snippets |
 | 5 | Status / Health Check | Environment, role, Xray version, TUN device, profiles, `Table = off` audit, WireGuard handshake age, panel snippets, Cloudflare `cdn-cgi/trace` through the WARP interface, overall health |
 
 Every command is also available non-interactively (`warp-manager install`,
-`warp-manager remove`, ...). Two extra CLI-only commands avoid a reinstall
-when only the panel config needs to change:
+`warp-manager remove`, ...). **Option 1 never just stops**: it installs on a
+fresh server and repairs on a configured one (`sudo warp-manager repair --yes`
+does the same directly). Run it on BOTH servers - see
+[docs/TWO-SERVERS.md](docs/TWO-SERVERS.md).
+
+`warp-check` verifies the whole path without changing anything; `repair` rebuilds
+only the server it runs on from the saved `state.env` credentials. Both servers
+also receive `/opt/pasarguard-warp/SERVER-GUIDE.md`.
+
+Two extra CLI-only commands avoid a reinstall when only the panel config needs
+to change:
 
 ```bash
 sudo warp-manager apply --panel-url https://panel.example.com \
@@ -799,7 +816,7 @@ contains the link password: keep it private.
 
 ---
 
-## One dedicated WARP inbound, all existing configs untouched (1.0.18)
+## One dedicated WARP inbound, all existing configs untouched (1.0.18, repair in 1.0.19)
 
 If **no** existing config (`cdn`, `direct` or `tunnel`) should use WARP, create
 a brand-new inbound on the **Iran main panel** server. Only that new inbound

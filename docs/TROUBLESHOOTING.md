@@ -1,7 +1,12 @@
 # Troubleshooting
 
-All checks below are available through `warp-manager status` and
-`warp-manager logs`.
+All checks below are available through `warp-manager status`,
+`warp-manager warp-check` and `warp-manager logs`.
+
+> **TWO SERVERS ARE REQUIRED.** The script must be installed and run on BOTH
+> the FOREIGN relay and the IRAN main panel. Full per-server commands:
+> [TWO-SERVERS.md](TWO-SERVERS.md) and
+> `/opt/pasarguard-warp/SERVER-GUIDE.md` on each server.
 
 ## 1. SSH / server access lost after installing the kernel backend
 
@@ -451,3 +456,73 @@ Then: `Hosts -> Add Host -> Inbound tag: WARP-DEDICATED`, address = Iran IP,
 port = the port printed by the command, other fields at their defaults. The
 old SOCKS5 inbound is replaced automatically. All existing configs stay
 unchanged.
+
+
+---
+
+## Deleting WARP items on the FOREIGN server cuts the Iran WARP config
+
+Symptom: to test whether the connection still works "without the inbound,
+outbound and routing rule", those items were removed from the FOREIGN Core
+config. The `WARP-DEDICATED` config on Iran immediately stopped working, while
+`cdn` / `direct` / `tunnel` configs stayed healthy.
+
+Cause: the Iran side is only the first half of the chain:
+
+```
+client -> WARP-DEDICATED (Iran) -> WARP-LINK SOCKS outbound (Iran)
+       -> WARP-LINK SOCKS inbound (Foreign) -> warp outbound (Foreign)
+       -> Cloudflare WARP -> Internet
+```
+
+If the FOREIGN inbound, outbound or rule disappears, the TCP connection from
+Iran has nothing to talk to. This is expected behaviour, not a broken install.
+
+**Do NOT test by deleting those items.** Use the non-destructive check on BOTH
+servers:
+
+```bash
+sudo warp-manager warp-check
+```
+
+It verifies the TCP port, the live Cloudflare path and the Panel Core config,
+and reports exactly which half is missing.
+
+Recovery (no reinstall, no remove, no paste): **FOREIGN server FIRST**.
+
+```bash
+# 1) FOREIGN server
+sudo warp-manager update --yes
+sudo warp-manager repair --yes
+
+# 2) IRAN server
+sudo warp-manager update --yes
+sudo warp-manager repair --yes
+
+# 3) BOTH servers
+sudo warp-manager warp-check
+```
+
+`repair` reuses the saved link credentials in `state.env` (same port, user and
+password), so the `WARPLINK1:` line is not needed again. It detects which
+server it is on and rebuilds only that server's half. On the IRAN server it
+rebuilds its own config even if the foreign link is temporarily down, and
+prints the exact commands for the other server.
+
+---
+
+## Option 1 must install OR repair, never just stop
+
+From 1.0.19 the numbered menu is `1) Install / Repair WARP`. On a fresh server
+option 1 runs the full install wizard; on a server that already has state it
+**REPAIRS** the dedicated setup instead of printing "already installed, use
+--force" and stopping. The same is available non-interactively:
+
+```bash
+sudo warp-manager repair --yes
+sudo warp-manager warp-check
+```
+
+Run option 1 / `repair` / `warp-check` / `update` / `status` on **BOTH**
+servers. See [TWO-SERVERS.md](TWO-SERVERS.md) for the complete per-server
+command list.

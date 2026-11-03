@@ -95,7 +95,8 @@ fi
 # ---------------------------------------------------------------------------
 printf '\n[4] Interactive menu (piped input)\n'
 menu_out="$(printf '6\n' | WARP_APP_DIR="$WORK/menu-app" bash "$ROOT/warp-manager.sh" menu 2>&1 || true)"
-check "menu lists Install option" bash -c "printf '%s' \"\$1\" | grep -q 'Install / Configure WARP'" _ "$menu_out"
+check "menu lists Install option" bash -c "printf '%s' \"\$1\" | grep -q 'Install / Repair WARP'" _ "$menu_out"
+check "menu Install option says it can repair" bash -c "printf '%s' \"\$1\" | grep -q 'Install / Repair WARP'" _ "$menu_out"
 check "menu lists Update Script option" bash -c "printf '%s' \"\$1\" | grep -q 'Update Script'" _ "$menu_out"
 check "menu exits cleanly on option 6" bash -c "printf '%s' \"\$1\" | grep -q 'Goodbye'" _ "$menu_out"
 
@@ -1406,6 +1407,106 @@ check "warp-link PUT is valid JSON with the WARP-LINK inbound" \
   bash -c "jq -e '[.config.inbounds[].tag] | index(\"WARP-LINK\") != null' '$WORK/noisy-put.json' >/dev/null"
 check "warp-link prints exactly one WARPLINK1 line" \
   bash -c "[[ \$(grep -c '^WARPLINK1:' '$WORK/noisy-link.out') -eq 1 ]]"
+# ---------------------------------------------------------------------------
+printf '\n[8s] Two-server install-or-repair, repair and warp-check (1.0.19)\n'
+cat >"$WORK/two-server-e2e.sh" <<'EOS'
+WD="$1"; ROOT="$2"; SCENARIO="$3"
+WARP_APP_DIR="$WD/app-$SCENARIO"
+source "$ROOT/warp-manager.sh" >/dev/null 2>&1 || true
+state_init
+mkdir -p "$BACKUP_DIR" "$PROFILE_DIR/default"
+state_set_many "INSTALLED=1" "PROFILES=default" "PANEL_API_KEY=pg_key_test" "PANEL_URL=http://127.0.0.1:8000" \
+  "WARP_LINK_HOST=95.135.200.231" "WARP_LINK_PORT=29580" "WARP_LINK_USER=warpu" \
+  "WARP_LINK_PASS=passw" "WARP_LINK_TAG=WARP-LINK" "WARP_LINK_CORE=1"
+PANEL_CORE_ID=1
+cat >"$PROFILE_DIR/default/meta.env" <<'META'
+PRIVATE_KEY='AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA='
+ADDRESS4='172.16.0.2/32'
+ADDRESS6=''
+PUBLIC_KEY='bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo='
+ENDPOINT='engage.cloudflareclient.com:2408'
+TAG='warp'
+META
+chmod 600 "$PROFILE_DIR/default/meta.env"
+
+CORE_EMPTY='{"id":1,"name":"Core","type":"xray","config":{"inbounds":[{"tag":"[DE] - DC - Reality","protocol":"vless","port":443},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"Germany","protocol":"vless","port":64483}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Out-DE","protocol":"freedom"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK"},{"type":"field","inboundTag":["[DE] - Tunnel - ArvanCloud"],"outboundTag":"Out-DE"}]}}}'
+CORE_FOREIGN_OK='{"id":1,"name":"Core","type":"xray","config":{"inbounds":[{"tag":"Germany","protocol":"vless","port":64483},{"tag":"WARP-LINK","protocol":"socks","port":29580}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"warp","protocol":"wireguard"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"outboundTag":"BLOCK"},{"type":"field","inboundTag":["WARP-LINK"],"outboundTag":"warp"}]}}}'
+CORE_IRAN_OK='{"id":1,"name":"Core","type":"xray","config":{"inbounds":[{"tag":"[DE] - DC - Reality","protocol":"vless","port":443},{"tag":"WARP-DEDICATED","protocol":"vless","port":31234}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"WARP-LINK","protocol":"socks"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"outboundTag":"BLOCK"},{"type":"field","inboundTag":["WARP-DEDICATED"],"outboundTag":"WARP-LINK"}]}}}'
+CORE="$CORE_EMPTY"
+case "$SCENARIO" in
+  foreign-check|check-missing-foreign) CORE="$CORE_FOREIGN_OK" ;;
+  iran-*|check-missing-iran) CORE="$CORE_IRAN_OK" ;;
+esac
+[[ "$SCENARIO" == "check-missing-foreign" || "$SCENARIO" == "check-missing-iran" ]] && CORE="$CORE_EMPTY"
+[[ "$SCENARIO" == iran-* || "$SCENARIO" == check-missing-iran ]] && \
+  state_set_many "WARP_IN_TAG=WARP-DEDICATED" "WARP_IN_PORT=31234" "PROFILE_IMPORTED=1"
+[[ "$SCENARIO" == "iran-down" ]] && timeout() { return 1; }
+
+panel_login() { return 0; }
+confirm() { return 0; }
+ensure_api_key() { return 0; }
+curl() { printf '{"ip":"104.28.219.182","org":"AS13335 Cloudflare, Inc."}'; }
+panel_api() {
+  local m="$1" p="$2" b="${3:-}"
+  if [[ "$m" == GET && "$p" == /cores ]]; then PANEL_API_BODY='{"cores":[{"id":1,"name":"Core"}]}'; return 0; fi
+  if [[ "$m" == GET && "$p" == /core/* ]]; then PANEL_API_BODY="$CORE"; return 0; fi
+  if [[ "$m" == PUT ]]; then printf '%s' "$b" > "$WD/put-$SCENARIO.json"; PANEL_API_BODY='{}'; return 0; fi
+  return 1
+}
+case "$SCENARIO" in
+  foreign-install)  cmd_install ;;
+  foreign-repair)   cmd_repair ;;
+  iran-repair)      cmd_repair ;;
+  iran-down)        cmd_repair ;;
+  *check*)          cmd_warp_check ;;
+esac
+EOS
+for m in foreign-install foreign-repair iran-repair iran-down foreign-check iran-check check-missing-foreign check-missing-iran; do
+  bash "$WORK/two-server-e2e.sh" "$WORK" "$ROOT" "$m" > "$WORK/out-$m.txt" 2>&1 || true
+done
+check "option 1 repairs instead of stopping with 'use --force'" \
+  bash -c "! grep -q 'Use --force to reconfigure' '$WORK/out-foreign-install.txt' && grep -q 'REPAIR it instead' '$WORK/out-foreign-install.txt'"
+check "option 1 on the FOREIGN server actually rebuilds the WARP link" \
+  bash -c "jq -e '[.config.inbounds[].tag] | index(\"WARP-LINK\") != null' '$WORK/put-foreign-install.json' >/dev/null"
+check "repair on the FOREIGN server restores the WARP outbound and rule" \
+  bash -c "jq -e '[.config.outbounds[].tag] | index(\"warp\") != null' '$WORK/put-foreign-repair.json' >/dev/null && jq -e '[.config.routing.rules[].outboundTag] | index(\"warp\") != null' '$WORK/put-foreign-repair.json' >/dev/null"
+check "repair reuses the saved link password (no new WARPLINK1 needed)" \
+  bash -c "grep -q 'WARPLINK1:' '$WORK/out-foreign-repair.txt' && jq -e '.config.outbounds[] | select(.tag==\"WARP-LINK\") | .settings.servers[0].users[0].pass == \"passw\"' '$WORK/put-iran-repair.json' >/dev/null"
+check "repair on the IRAN server restores the dedicated VLESS inbound" \
+  bash -c "jq -e '[.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .protocol] == [\"vless\"]' '$WORK/put-iran-repair.json' >/dev/null"
+check "repair on IRAN with a dead FOREIGN link gives the exact server order" \
+  bash -c "grep -q 'FIRST run on the FOREIGN server' '$WORK/out-iran-down.txt' && grep -q 'THEN run' '$WORK/out-iran-down.txt'"
+check "warp-check passes on a healthy FOREIGN server" \
+  bash -c "grep -q 'Dedicated WARP link check: OK' '$WORK/out-foreign-check.txt'"
+check "warp-check passes on a healthy IRAN server" \
+  bash -c "grep -q 'Dedicated WARP link check: OK' '$WORK/out-iran-check.txt'"
+check "warp-check detects a deleted FOREIGN WARP config" \
+  bash -c "grep -q 'MISSING a WARP inbound' '$WORK/out-check-missing-foreign.txt'"
+check "warp-check detects a deleted IRAN WARP config" \
+  bash -c "grep -q 'MISSING a WARP inbound' '$WORK/out-check-missing-iran.txt'"
+check "warp-check tells the user NOT to delete WARP items to test" \
+  bash -c "grep -q 'Do NOT delete WARP inbounds/outbounds/rules' '$WORK/out-iran-check.txt'"
+check "warp-check prints the commands for BOTH servers" \
+  bash -c "grep -q 'FOREIGN server:' '$WORK/out-iran-check.txt' && grep -q 'IRAN server:' '$WORK/out-iran-check.txt'"
+check "--help documents install-or-repair, repair and warp-check" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'REPAIR an existing setup' && bash '$ROOT/warp-manager.sh' --help | grep -q 'warp-check' && bash '$ROOT/warp-manager.sh' --help | grep -q 'repair      Repair'"
+check "--help states the script must run on BOTH servers" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'MUST BE INSTALLED AND RUN ON BOTH SERVERS'"
+check "option 1 NEVER stops: repairs IRAN even when the FOREIGN link is down" \
+  bash -c "jq -e '[.config.inbounds[].tag] | index(\"WARP-DEDICATED\") != null' '$WORK/put-iran-down.json' >/dev/null && grep -q 'FIRST run on the FOREIGN server' '$WORK/out-iran-down.txt'"
+check "repair writes SERVER-GUIDE.md with commands for BOTH servers" \
+  bash -c "test -f '$WORK/app-iran-repair/SERVER-GUIDE.md' && grep -q 'FOREIGN relay server' '$WORK/app-iran-repair/SERVER-GUIDE.md' && grep -q 'IRAN MAIN PANEL server' '$WORK/app-iran-repair/SERVER-GUIDE.md' && grep -q 'warp-manager repair --yes' '$WORK/app-iran-repair/SERVER-GUIDE.md'"
+check "SERVER-GUIDE.md states BOTH servers are required" \
+  bash -c "grep -q 'TWO SERVERS REQUIRED' '$WORK/app-foreign-repair/SERVER-GUIDE.md' && grep -q 'Do NOT test by deleting' '$WORK/app-foreign-repair/SERVER-GUIDE.md'"
+check "a fresh install still prints the two-server next steps" \
+  bash -c "sed -n '/^cmd_install_fresh()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'Two servers are required' && sed -n '/^cmd_install_fresh()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'warp-link --yes'"
+check "option 1 dispatch is install-or-repair, never a dead stop" \
+  bash -c "sed -n '/^cmd_install()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'cmd_repair' && ! sed -n '/^cmd_install()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'Use --force to reconfigure'"
+check "docs/TWO-SERVERS.md exists and lists per-server commands" \
+  bash -c "test -f '$ROOT/docs/TWO-SERVERS.md' && grep -q 'FOREIGN' '$ROOT/docs/TWO-SERVERS.md' && grep -q 'IRAN' '$ROOT/docs/TWO-SERVERS.md' && grep -q 'repair --yes' '$ROOT/docs/TWO-SERVERS.md'"
+check "warp_detect_role reports foreign / iran correctly" \
+  bash -c "grep -Eq 'Detected role +foreign' '$WORK/out-foreign-check.txt' && grep -Eq 'Detected role +iran' '$WORK/out-iran-check.txt' && grep -q 'Detected role: FOREIGN relay server.' '$WORK/out-foreign-repair.txt'"
+
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "

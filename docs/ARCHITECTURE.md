@@ -231,3 +231,15 @@ generates client links from the inbound's protocol. A `socks` inbound produces
 no usable v2rayNG / v2rayN config and no normal Host, so the user could not
 create a host with it. From 1.0.18 the dedicated inbound is a clone of a real
 proxy inbound; `warp-inbound` also replaces any leftover 1.0.17 SOCKS inbound.
+
+
+## 4. Both servers must run the script (1.0.19)
+
+WARP terminates on the FOREIGN relay; the IRAN main panel only carries the
+dedicated `WARP-DEDICATED` inbound and a `WARP-LINK` SOCKS outbound. Deleting
+the FOREIGN WARP inbound/outbound/routing rule cuts the Iran WARP config. Menu
+option 1 (`Install / Repair WARP`) installs on a fresh server and repairs on a
+configured one; `warp-manager repair --yes` and `warp-manager warp-check` are
+the non-destructive equivalents and must be run on BOTH servers (FOREIGN
+first). Full per-server commands: [TWO-SERVERS.md](TWO-SERVERS.md) plus
+`/opt/pasarguard-warp/SERVER-GUIDE.md` written locally by the script.

@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.18"
+readonly SCRIPT_VERSION="1.0.19"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="arena/01417195-warp-pasarguard"
@@ -2291,7 +2291,226 @@ install_plan() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Two-server repair / health check (1.0.19)
+# -----------------------------------------------------------------------------
+# Both servers run this script. Option 1 (install) must never just stop: it
+# installs a fresh setup, or repairs an existing dedicated WARP deployment.
+write_server_guide() {
+  local f="$APP_DIR/SERVER-GUIDE.md" host port
+  host="$(state_get WARP_LINK_HOST "")"
+  port="$(state_get WARP_LINK_PORT "")"
+  mkdir -p "$APP_DIR" 2>/dev/null || return 0
+  cat >"$f" <<GUIDE
+# PasarGuard WARP Manager - TWO SERVERS REQUIRED
+
+This script MUST be installed and run on BOTH servers. WARP itself terminates
+on the FOREIGN relay; the IRAN main panel only carries one dedicated inbound.
+Deleting the WARP inbound / outbound / routing rule on the FOREIGN server cuts
+the WARP config on Iran. Do NOT test by deleting - use 'warp-manager warp-check'.
+
+Saved WARP link on this host: __HOST__:__PORT__ (TCP, credentials in state.env).
+
+## Install the script on BOTH servers (one time)
+
+    curl -fsSL -H 'Accept: application/vnd.github.raw' 'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' | sudo bash -s -- --branch arena/01417195-warp-pasarguard
+
+## FOREIGN relay server
+
+    sudo warp-manager update --yes
+    sudo warp-manager                      # menu option 1 (install / repair)
+    sudo warp-manager warp-link --show     # print the saved WARPLINK1 line
+    sudo warp-manager warp-check
+    sudo warp-manager status
+
+Keeps: WARP-LINK SOCKS inbound, warp outbound (before BLOCK), one scoped rule.
+
+## IRAN MAIN PANEL server
+
+    sudo warp-manager update --yes
+    sudo warp-manager                      # menu option 1 (install / repair)
+    sudo warp-manager warp-inbound 'WARPLINK1:...' --yes   # first time only
+    sudo warp-manager warp-check
+    sudo warp-manager status
+
+Keeps: WARP-DEDICATED inbound (clone of a real VLESS/Reality inbound),
+WARP-LINK SOCKS outbound (before BLOCK), one scoped rule.
+Create the Host in the Panel: Hosts -> Add Host -> Inbound tag WARP-DEDICATED.
+
+## Repair after anything was deleted (run in THIS order)
+
+    # 1) FOREIGN server
+    sudo warp-manager update --yes
+    sudo warp-manager repair --yes
+
+    # 2) IRAN server
+    sudo warp-manager update --yes
+    sudo warp-manager repair --yes
+
+    # 3) BOTH servers
+    sudo warp-manager warp-check
+
+The saved link credentials in state.env (mode 0600) are reused, so no line has
+to be pasted again. Full documentation: docs/TWO-SERVERS.md in the repository.
+GUIDE
+  sed -i "s/__HOST__/${host:-FOREIGN-IP}/; s/__PORT__/${port:-PORT}/" "$f" 2>/dev/null || true
+  chmod 644 "$f" 2>/dev/null || true
+  if [[ "${WARP_GUIDE_WRITTEN:-0}" != "1" ]]; then
+    info "Per-server command guide written to ${f}"
+    WARP_GUIDE_WRITTEN=1
+  fi
+}
+
+warp_detect_role() {
+  local in_tag link_pass imported
+  in_tag="$(state_get WARP_IN_TAG "")"
+  link_pass="$(state_get WARP_LINK_PASS "")"
+  imported="$(state_get PROFILE_IMPORTED 0)"
+  if [[ -n "$in_tag" ]]; then printf 'iran'; return 0; fi
+  if [[ -n "$link_pass" && "$imported" == "1" ]]; then printf 'iran'; return 0; fi
+  if [[ -n "$link_pass" ]]; then printf 'foreign'; return 0; fi
+  printf 'none'
+}
+
+cmd_repair() {
+  state_init
+  load_saved_api_key; load_saved_panel_url
+  have jq || die "jq is required."
+  header "$APP_NAME v$SCRIPT_VERSION - Repair dedicated WARP"
+  local role; role="$(warp_detect_role)"
+  case "$role" in
+    foreign)
+      info "Detected role: FOREIGN relay server."
+      info "Rebuilding the WARP-LINK inbound, WARP outbound and WARP rule from saved credentials."
+      info "The Iran server needs NO change: the same port, user and password are reused."
+      WARP_LINK_SHOW=0
+      cmd_warp_link
+      ;;
+    iran)
+      info "Detected role: IRAN MAIN PANEL server."
+      local blob lh lp
+      blob="$(warp_link_blob_from_state)" || die "No saved WARP link on this host. Run 'warp-manager warp-link --show' on the FOREIGN server and 'warp-inbound' here."
+      lh="$(printf '%s' "$blob" | base64 -d 2>/dev/null | jq -r .host)"
+      lp="$(printf '%s' "$blob" | base64 -d 2>/dev/null | jq -r .port)"
+      if ! timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$lh" "$lp" 2>/dev/null; then
+        error "The FOREIGN WARP link ${lh}:${lp} is not reachable."
+        info "FIRST run on the FOREIGN server: warp-manager repair --yes"
+        info "THEN run 'warp-manager repair --yes' here again."
+        info "Do not delete any inbound/outbound/rule to test the link; use 'warp-manager warp-check'."
+        warn "Still rebuilding THIS server's WARP config so it is ready when the foreign link returns."
+        WARP_SKIP_LINK_CHECK=1
+      fi
+      info "Rebuilding the dedicated WARP inbound, WARP-LINK outbound and its routing rule."
+      cmd_warp_inbound ""
+      WARP_SKIP_LINK_CHECK=0
+      ;;
+    none)
+      if is_installed; then
+        warn "WARP is installed but no dedicated two-server link is configured on this host."
+        info "FOREIGN server:  warp-manager warp-link --yes"
+        info "IRAN server:     warp-manager warp-inbound 'WARPLINK1:...' --yes"
+        info "See docs/TWO-SERVERS.md for the full commands for BOTH servers."
+      else
+        info "Nothing is installed on this server yet. Running a fresh install..."
+        cmd_install_fresh
+      fi
+      ;;
+  esac
+  write_server_guide
+  info "Verify the whole path with: warp-manager warp-check"
+  info "This script must be installed and run on BOTH servers. See docs/TWO-SERVERS.md and SERVER-GUIDE.md."
+  return 0
+}
+
+cmd_warp_check() {
+  state_init
+  load_saved_api_key; load_saved_panel_url
+  have jq || die "jq is required."
+  header "$APP_NAME v$SCRIPT_VERSION - Dedicated WARP link check"
+  local blob link lh lp lu ls role problems=0 probe cid cfg q
+  blob="$(warp_link_blob_from_state)" \
+    || die "No dedicated WARP link is configured here. Run 'warp-manager install' (option 1) first."
+  link="$(printf '%s' "$blob" | base64 -d 2>/dev/null)" || die "Saved link data is invalid. Run 'warp-manager repair --yes'."
+  lh="$(jq -r .host <<<"$link")"; lp="$(jq -r .port <<<"$link")"
+  lu="$(jq -r .user <<<"$link")"; ls="$(jq -r .pass <<<"$link")"
+  role="$(warp_detect_role)"
+  printf '  %-20s %s\n' "Detected role" "$role"
+  printf '  %-20s %s\n' "Foreign link" "${lh}:${lp}"
+  printf '  %-20s %s\n' "Link credentials" "saved in state.env (0600)"
+
+  if timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$lh" "$lp" 2>/dev/null; then
+    ok "FOREIGN WARP link port is reachable from this server."
+  else
+    bad "FOREIGN WARP link port is NOT reachable. Run 'warp-manager repair --yes' on the FOREIGN server."
+    problems=$((problems + 1))
+  fi
+  if have curl; then
+    probe="$(curl -sS --max-time 20 -x "socks5h://${lu}:${ls}@${lh}:${lp}" \
+              https://ipinfo.io/json 2>/dev/null || true)"
+    if printf '%s' "$probe" | jq -e '.org // "" | test("Cloudflare"; "i")' >/dev/null 2>&1; then
+      ok "Live WARP path: $(printf '%s' "$probe" | jq -r '.ip + " / " + (.org // "?")')"
+    else
+      bad "Live WARP path did not reach Cloudflare: $(printf '%s' "$probe" | head -c 160)"
+      problems=$((problems + 1))
+    fi
+  fi
+
+  cid="$(state_get WARP_LINK_CORE "")"
+  if [[ -n "$cid" && -n "$PANEL_API_KEY" ]] && panel_login >/dev/null 2>&1; then
+    if panel_api GET "/core/${cid}" >/dev/null 2>&1; then
+      cfg="$PANEL_API_BODY"
+      if [[ "$role" == "foreign" ]]; then
+        q='[ (.config.inbounds // [])[] | .tag ] as $i
+           | [ (.config.outbounds // [])[] | .tag ] as $o
+           | [ (.config.routing.rules // [])[] | .outboundTag ] as $r
+           | ($i | index("WARP-LINK")) != null
+             and ($o | index("warp")) != null
+             and ($r | index("warp")) != null'
+      else
+        q='[ (.config.inbounds // [])[] | .tag ] as $i
+           | [ (.config.outbounds // [])[] | .tag ] as $o
+           | [ (.config.routing.rules // [])[] | .outboundTag ] as $r
+           | ($i | index("WARP-DEDICATED")) != null
+             and ($o | index("WARP-LINK")) != null
+             and ($r | index("WARP-LINK")) != null'
+      fi
+      if jq -e "$q" <<<"$cfg" >/dev/null 2>&1; then
+        ok "Panel Core ${cid} contains the WARP inbound, outbound and routing rule."
+      else
+        bad "Panel Core ${cid} is MISSING a WARP inbound, outbound or routing rule. Run 'warp-manager repair --yes'."
+        problems=$((problems + 1))
+      fi
+    else
+      warn "Could not read Panel Core ${cid}; skipping the Core config check."
+    fi
+  else
+    warn "No usable Panel API key / Core id; skipping the Core config check."
+  fi
+
+  header "Both servers are required"
+  if [[ "$role" == "iran" ]]; then
+    info "FOREIGN server:  warp-manager update --yes && warp-manager repair --yes"
+    info "IRAN server:     warp-manager update --yes && warp-manager repair --yes"
+  else
+    info "FOREIGN server:  warp-manager update --yes && warp-manager repair --yes"
+    info "IRAN server:     warp-manager update --yes && warp-manager repair --yes"
+  fi
+  info "Do NOT delete WARP inbounds/outbounds/rules to test the link. Use 'warp-manager warp-check'."
+  if (( problems == 0 )); then ok "Dedicated WARP link check: OK"; else warn "Dedicated WARP link check: ${problems} item(s) need attention."; fi
+  return 0
+}
+
 cmd_install() {
+  state_init
+  if is_installed && [[ "$FORCE" != "1" ]]; then
+    warn "WARP is already managed on this server. Option 1 will REPAIR it instead of reinstalling."
+    cmd_repair
+    return $?
+  fi
+  cmd_install_fresh
+}
+
+cmd_install_fresh() {
   state_init
   detect_os
   detect_role
@@ -2408,6 +2627,13 @@ TXT
   header "Installation complete"
   info "Run 'warp-manager status' to verify the health of the deployment."
   info "Run 'warp-manager logs' to inspect service output."
+  header "Two servers are required (dedicated WARP)"
+  warn "The full WARP account/profile is now on THIS server. Do NOT use 'apply' for the dedicated setup."
+  info "FOREIGN server:  warp-manager warp-link --yes      (prints one WARPLINK1: line)"
+  info "IRAN server:     warp-manager warp-inbound 'WARPLINK1:...' --yes"
+  info "BOTH servers:    warp-manager repair --yes  /  warp-manager warp-check"
+  info "Install and run this script on BOTH servers. See docs/TWO-SERVERS.md."
+  write_server_guide
 }
 
 # -----------------------------------------------------------------------------
@@ -2853,7 +3079,10 @@ cmd_warp_link() {
   printf '\nWARPLINK1:%s\n\n' "$blob"
   ok "Dedicated WARP link created on port ${port}. ONLY traffic sent to this link uses WARP."
   info "The link listens on ${host}:${port} (TCP). If a firewall on the FOREIGN host filters it, allow that port; the node container uses host networking."
-  info "On the IRAN main panel server run: warp-manager warp-inbound 'WARPLINK1:<line above>'"
+  info "On the IRAN main panel server run: warp-manager warp-inbound 'WARPLINK1:<line above>' --yes"
+  info "BOTH servers need this script. To repair later: 'warp-manager repair --yes' on each server."
+  info "Never delete the WARP inbound/outbound/rule to test; use 'warp-manager warp-check'."
+  write_server_guide
   rm -f -- "$merged"
   return 0
 }
@@ -2905,13 +3134,16 @@ cmd_warp_inbound() {
   lh="$(jq -r .host <<<"$link")"; lp="$(jq -r .port <<<"$link")"
   lu="$(jq -r .user <<<"$link")"; ls="$(jq -r .pass <<<"$link")"
   lt="$(jq -r .tag <<<"$link")"
-  if ! timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$lh" "$lp" 2>/dev/null; then
+  if [[ "${WARP_SKIP_LINK_CHECK:-0}" == "1" ]]; then
+    warn "Skipping the foreign link check (repair mode); rebuilding the local config anyway."
+  elif ! timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$lh" "$lp" 2>/dev/null; then
     die "The WARP link ${lh}:${lp} is not reachable from this server. Open TCP ${lp} on the FOREIGN server, then retry."
+  else
+    ok "WARP link ${lh}:${lp} is reachable from this server."
   fi
-  ok "WARP link ${lh}:${lp} is reachable from this server."
 
   # Real traffic test: Iran -> foreign SOCKS link -> WARP -> Cloudflare.
-  if have curl; then
+  if have curl && [[ "${WARP_SKIP_LINK_CHECK:-0}" != "1" ]]; then
     local probe
     probe="$(curl -sS --max-time 20 \
               -x "socks5h://${lu}:${ls}@${lh}:${lp}" \
@@ -3039,7 +3271,11 @@ cmd_warp_inbound() {
   printf '  %s\n' "Address: ${myip:-THIS-SERVER-IP}   Port: ${inport}   (leave the other fields at their defaults)"
   info "The Panel lists this inbound immediately after the Core update. The generated config works in v2rayNG / v2rayN."
   info "Allow TCP ${inport} on the IRAN host firewall. Only the host(s) you create on ${tag} use WARP."
+  info "The FOREIGN server must keep its WARP-LINK inbound/outbound/rule; if it is removed this config stops."
+  info "BOTH servers need this script: to repair run 'warp-manager repair --yes' on each. See docs/TWO-SERVERS.md."
+  info "Do not delete WARP items to test the link; run 'warp-manager warp-check'."
   ok "All existing cdn / direct / tunnel inbounds and their routing rules are unchanged."
+  write_server_guide
   rm -f -- "$merged"
   return 0
 }
@@ -3762,7 +3998,7 @@ cmd_menu() {
     print_banner
     local c
     c="$(choose "Main menu - select an option:" \
-        "Install / Configure WARP" \
+        "Install / Repair WARP" \
         "Remove / Uninstall WARP" \
         "Update Script" \
         "View Logs" \
@@ -3795,7 +4031,9 @@ Usage:
   warp-manager                       Open the interactive numbered menu.
 
 Commands:
-  install     Install / configure WARP
+  install     Install / configure WARP, or REPAIR an existing setup (option 1)
+  repair      Repair the dedicated WARP link on THIS server (no reinstall)
+  warp-check  Verify the whole two-server WARP path without changing anything
   remove      Remove / uninstall WARP
   update      Update this script
   logs        View logs
@@ -3818,11 +4056,15 @@ Commands:
   warp-join 'WARPLINK1:...'  Alias for warp-inbound (kept for compatibility)
   help        Show this help
 
-Server selection: install on the MAIN PANEL server (Iran), where the user
-  inbounds live. Do NOT add a local WARP outbound there: Cloudflare WARP is
-  filtered on Iranian hosts. Instead run warp-link on the FOREIGN server and
-  warp-join on the Iran server, so only the tunnel configs use WARP.
-  See docs/ARCHITECTURE.md section 2.1.
+Server selection: THIS SCRIPT MUST BE INSTALLED AND RUN ON BOTH SERVERS.
+  * FOREIGN relay server: warp-link --yes creates the WARP-LINK inbound, the
+    userspace WARP outbound and its routing rule. WARP terminates here.
+  * IRAN MAIN PANEL server: warp-inbound clones a real VLESS inbound as
+    WARP-DEDICATED; only that config uses WARP. No local WARP outbound there.
+  Deleting the WARP inbound/outbound/rule on the FOREIGN server cuts the WARP
+  config on Iran. Do NOT test by deleting: run 'warp-manager warp-check' and
+  'warp-manager repair --yes' on BOTH servers instead.
+  Full per-server commands: docs/TWO-SERVERS.md and docs/ARCHITECTURE.md 2.1.
 
 Install options:
   --mode xray|kernel        WARP backend (default: asked interactively)
@@ -3896,7 +4138,7 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key|export-profile|import-profile|warp-link|warp-join|warp-inbound|warp-unlink) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key|export-profile|import-profile|warp-link|warp-join|warp-inbound|warp-unlink|repair|warp-check) COMMAND="$1"; shift ;;
       WARP1:*) PROFILE_BLOB="${1#WARP1:}"; shift ;;
       WARPLINK1:*) WARP_LINK_BLOB="${1#WARPLINK1:}"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
@@ -4013,6 +4255,8 @@ main() {
     warp-join) require_root; cmd_warp_join "$WARP_LINK_BLOB" ;;
     warp-inbound) require_root; cmd_warp_inbound "$WARP_LINK_BLOB" ;;
     warp-unlink) require_root; cmd_warp_unlink ;;
+    repair) require_root; cmd_repair ;;
+    warp-check) require_root; cmd_warp_check ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac
