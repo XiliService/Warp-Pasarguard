@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.3"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -100,6 +100,7 @@ OS_ID="unknown"; OS_VER="unknown"; ARCH="unknown"; KERNEL="unknown"
 WGCF_ARCH="amd64"; DETECTED_ROLE="unknown"
 PRIMARY_IP=""; DEFAULT_ROUTE=""; DEFAULT_GW=""; DEFAULT_DEV=""
 XRAY_VERSION="unknown"; COMPOSE_SERVICES=""
+COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""
 ROUTE_GUARD=0
 ROUTE_BEFORE=""
 COMPOSE_FILE=""
@@ -453,8 +454,36 @@ print_environment() {
 }
 
 detect_compose() {
-  local d f
+  local d f name cfg image hint
   COMPOSE_FILE=""
+  COMPOSE_CONTAINER=""
+  COMPOSE_SERVICE_HINT=""
+
+  # Ask Docker Compose itself where each running container came from. This is
+  # more reliable than path guessing, and lets us prefer the NODE container
+  # (whose Xray process actually executes the WARP outbound).
+  if have docker; then
+    while IFS= read -r name; do
+      [[ -n "$name" ]] || continue
+      cfg="$(docker inspect "$name" \
+              --format '{{ index .Config.Labels "com.docker.compose.project.config_files" }}' 2>/dev/null || true)"
+      cfg="${cfg%%,*}"
+      [[ -n "$cfg" && "$cfg" != "<no value>" && -f "$cfg" ]] || continue
+      hint="$(docker inspect "$name" \
+              --format '{{ index .Config.Labels "com.docker.compose.service" }}' 2>/dev/null || true)"
+      [[ "$hint" == "<no value>" ]] && hint=""
+      image="$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || true)"
+      if [[ "$name" == *node* || "$image" == *node* || "$cfg" == *pg-node* ]]; then
+        COMPOSE_FILE="$cfg"; COMPOSE_CONTAINER="$name"; COMPOSE_SERVICE_HINT="$hint"
+        return 0
+      fi
+      if [[ -z "$COMPOSE_FILE" ]]; then
+        COMPOSE_FILE="$cfg"; COMPOSE_CONTAINER="$name"; COMPOSE_SERVICE_HINT="$hint"
+      fi
+    done < <(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    [[ -n "$COMPOSE_FILE" ]] && return 0
+  fi
+
   for d in ${COMPOSE_HINTS} "${PG_COMPOSE_DIR:-}" "$(pwd)"; do
     [[ -n "$d" && -d "$d" ]] || continue
     for f in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
@@ -915,13 +944,29 @@ patch_compose() {
 
   local -a candidates=() svc
   IFS=',' read -r -a candidates <<<"$services"
-  local selected=""
-  if (( ${#candidates[@]} == 1 )); then
+  local selected="" hint="${COMPOSE_SERVICE_HINT:-}"
+  if [[ -n "$hint" && ",$services," == *",$hint,"* ]]; then
+    selected="$hint"
+    info "Auto-selected compose service '${selected}' (container: ${COMPOSE_CONTAINER:-n/a})."
+  elif (( ${#candidates[@]} == 1 )); then
     selected="${candidates[0]}"
   else
-    local choice
-    choice="$(choose "Select the service that runs Xray on this host:" "${candidates[@]}")" || return 1
-    selected="${candidates[$((choice - 1))]}"
+    for svc in "${candidates[@]}"; do
+      if [[ "$svc" == *node* || "$svc" == *xray* ]]; then selected="$svc"; break; fi
+    done
+    if [[ -z "$selected" ]]; then
+      local choice
+      choice="$(choose "Select the service that runs Xray on this host:" "${candidates[@]}")" || return 1
+      selected="${candidates[$((choice - 1))]}"
+    else
+      info "Auto-selected compose service '${selected}' (node-like name)."
+    fi
+  fi
+
+  if [[ "$selected" != *node* && "$selected" != *xray* ]]; then
+    warn "Service '${selected}' does not look like a node service."
+    warn "The WARP outbound runs inside the NODE container; make sure that container"
+    warn "also has /dev/net/tun. Check: docker ps --format '{{.Names}} {{.Image}}'"
   fi
 
   info "Patching ${COMPOSE_FILE} (service: ${selected}) with /dev/net/tun permissions."
@@ -1071,13 +1116,27 @@ panel_login() {
   if [[ -z "$PANEL_PASS" ]]; then
     PANEL_PASS="$(ui_read_secret "Panel admin password: ")" || return 1
   fi
-  local resp
-  local -a opts=(-sS -X POST --connect-timeout 10 --max-time 30 -H 'Accept: application/json')
+  local code body tmp
+  tmp="$(mktemp)"
+  local -a opts=(-sS -X POST --connect-timeout 10 --max-time 30 \
+                 -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
   [[ "$INSECURE" == "1" ]] && opts+=(-k)
-  resp="$(curl "${opts[@]}" --data-urlencode "username=${PANEL_USER}" --data-urlencode "password=${PANEL_PASS}" \
-        "$(panel_endpoint)/admin/token" 2>/dev/null)" || return 1
-  PANEL_ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$resp" 2>/dev/null || true)"
-  [[ -n "$PANEL_ACCESS_TOKEN" ]] || { error "Panel authentication failed."; return 1; }
+  code="$(curl "${opts[@]}" --data-urlencode "username=${PANEL_USER}" \
+        --data-urlencode "password=${PANEL_PASS}" \
+        "$(panel_endpoint)/admin/token" 2>/dev/null)" || {
+    rm -f -- "$tmp"
+    error "Could not reach the panel API at $(panel_endpoint)/admin/token"
+    return 1
+  }
+  body="$(cat "$tmp")"; rm -f -- "$tmp"
+  PANEL_ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)"
+  if [[ -z "$PANEL_ACCESS_TOKEN" ]]; then
+    error "Panel authentication failed (HTTP ${code})."
+    printf '  Response: %.200s\n' "$body" >&2
+    warn "Check the admin username/password. PANEL_URL must be the dashboard root (no /api suffix)."
+    warn "Manual check: curl -i -X POST --data-urlencode 'username=USER' --data-urlencode 'password=PASS' $(panel_endpoint)/admin/token"
+    return 1
+  fi
   ok "Authenticated with the panel API."
 }
 
@@ -1546,6 +1605,26 @@ TXT
   info "Run 'warp-manager logs' to inspect service output."
 }
 
+cmd_apply() {
+  local action="${1:-apply}"
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - Apply Panel Config (${action})"
+  have jq || die "jq is required for panel API integration."
+  [[ -n "$PANEL_URL" ]] || die "Panel URL is required. Use --panel-url URL or PANEL_URL=... ."
+  local f
+  for f in outbounds.json routing-rules.json balancers.json; do
+    [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
+  done
+  if [[ "$action" == "apply" ]]; then
+    info "Pushing the generated WARP outbound/rules into the panel Core Settings."
+  else
+    info "Removing the WARP outbound/rules from the panel Core Settings."
+  fi
+  apply_to_panel "$action"
+  info "Done. Verify with: warp-manager status"
+  return 0
+}
+
 # -----------------------------------------------------------------------------
 # Remove
 # -----------------------------------------------------------------------------
@@ -1920,6 +1999,8 @@ Commands:
   logs        View logs
   status      Status / health check
   menu        Open the interactive menu
+  apply       Push generated snippets into the panel API (no reinstall)
+  unapply     Remove WARP outbound/rules from the panel API
   help        Show this help
 
 Install options:
@@ -1972,13 +2053,15 @@ Examples:
   warp-manager install --mode kernel --target exit --ip 203.0.113.10
   warp-manager status
   warp-manager update --check
+  warp-manager apply --panel-url https://panel.example.com \
+    --panel-user admin --panel-pass 'secret' --core-id 1 --yes
 EOF
 }
 
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply) COMMAND="$1"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -2065,6 +2148,8 @@ main() {
     update)    require_root; cmd_update ;;
     logs)      cmd_logs ;;
     status)    cmd_status ;;
+    apply)     require_root; cmd_apply apply ;;
+    unapply)   require_root; cmd_apply remove ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac

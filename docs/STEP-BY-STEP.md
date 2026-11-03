@@ -78,7 +78,7 @@ What the command means:
 Expected output:
 
 ```
-  PasarGuard WARP Manager - Bootstrap Installer v1.0.2
+  PasarGuard WARP Manager - Bootstrap Installer v1.0.3
 ==> Trying https://api.github.com/repos/.../contents/warp-manager.sh?ref=...
 ==> Installed: /opt/pasarguard-warp/warp-manager.sh
 ==> Command  : /usr/local/bin/warp-manager
@@ -92,7 +92,7 @@ Verify the installation:
 
 ```bash
 which warp-manager
-warp-manager --version          # PasarGuard WARP Manager 1.0.2
+warp-manager --version          # PasarGuard WARP Manager 1.0.3
 ls -l /usr/local/bin/warp-manager
 ```
 
@@ -251,6 +251,27 @@ docker exec pg-node sh -c 'grep -rl "warp" /var/lib/pg-node/generated/ 2>/dev/nu
 ```
 
 See `docs/PANEL-CONFIG.md` for complete JSON examples.
+
+### If the installer printed `WARN Could not authenticate`
+
+The install itself still succeeded, but the **panel config was NOT applied**,
+so WARP is not active yet. Either paste the snippets manually as described
+above, or fix the credentials and push them without reinstalling:
+
+```bash
+# Diagnose the login (HTTP 401 = wrong credentials, 404 = wrong URL)
+curl -i -X POST -H 'Accept: application/json' \
+  --data-urlencode 'username=admin' --data-urlencode 'password=YOUR_PASSWORD' \
+  https://panel.example.com/api/admin/token
+
+# Then apply the snippets that are already on disk
+sudo warp-manager apply --panel-url https://panel.example.com \
+  --panel-user admin --panel-pass 'YOUR_PASSWORD' --core-id 1 --yes
+```
+
+`PANEL_URL` must be the dashboard root (do **not** append `/api`). The admin
+account needs `cores:read` and `cores:update` permissions. Use `--insecure`
+only for self-signed certificates. `warp-manager unapply` reverses the change.
 
 ---
 

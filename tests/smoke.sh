@@ -49,6 +49,16 @@ printf '#!/usr/bin/env bash\necho 0\n' >"$WORK/bin/id"
 chmod +x "$WORK/bin/id"
 export PATH="$WORK/bin:$PATH"
 
+check "--help documents the apply command" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'apply       Push generated snippets'"
+apply_err="$(WARP_APP_DIR="$WORK/apply-app" bash "$ROOT/warp-manager.sh" apply --yes 2>&1 || true)"
+if printf '%s' "$apply_err" | grep -q 'Panel URL is required'; then
+  ok "apply without a panel URL fails with a clear message"
+else
+  fail "apply without a panel URL fails with a clear message"
+fi
+
+
 # ---------------------------------------------------------------------------
 printf '\n[3] Bootstrap installer (offline)\n'
 (
@@ -328,6 +338,52 @@ check "compose backup exists" bash -c "ls '$BACKUP_DIR'/docker-compose.yml.*.bak
 check "compose syntax still parses" bash -c "python3 -c 'import re,sys; lines=open(sys.argv[1]).read().splitlines(); assert any(l.startswith(\"services:\") for l in lines)' '$WORK/compose/docker-compose.yml'"
 restore_compose >/dev/null 2>&1
 check "compose can be restored from backup" cmp -s "$WORK/compose/docker-compose.yml" "$WORK/compose-original.yml"
+
+# ---------------------------------------------------------------------------
+printf '\n[8b] Compose file discovery via Docker labels\n'
+mkdir -p "$WORK/fakebin2" "$WORK/compose2"
+cat >"$WORK/compose2/docker-compose.yml" <<'YAML'
+services:
+  node:
+    image: pasarguard/node:latest
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+YAML
+cat >"$WORK/fakebin2/docker" <<EOF
+#!/usr/bin/env bash
+CFG="$WORK/compose2/docker-compose.yml"
+case "\${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1\npg-node\n'; exit 0 ;;
+  inspect)
+    name="\$2"; fmt="\$4"
+    case "\$fmt" in
+      *config_files*) printf '%s\n' "\$CFG" ;;
+      *com.docker.compose.service*) printf 'node\n' ;;
+      *Config.Image*)
+        if [[ "\$name" == *node* ]]; then printf 'pasarguard/node:latest\n'
+        else printf 'pasarguard/panel:latest\n'; fi ;;
+    esac
+    exit 0 ;;
+  compose) exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin2/docker"
+compose_out="$(WARP_APP_DIR="$WORK/compose-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin2:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    detect_compose
+    printf "%s|%s|%s" "$COMPOSE_FILE" "$COMPOSE_CONTAINER" "$COMPOSE_SERVICE_HINT"' 2>/dev/null || true)"
+assert_eq "detect_compose prefers the node container" \
+  "$WORK/compose2/docker-compose.yml|pg-node|node" "$compose_out"
+WARP_APP_DIR="$WORK/compose-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin2:$PATH" ASSUME_YES=1 bash -c '
+    source "$WARP_MANAGER"
+    detect_compose
+    patch_compose >/dev/null 2>&1' || true
+check "patch_compose auto-selects the node service without a prompt" \
+  grep -q '/dev/net/tun:/dev/net/tun' "$WORK/compose2/docker-compose.yml"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'

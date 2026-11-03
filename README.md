@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.2
+  PasarGuard WARP Manager  v1.0.3
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -184,7 +184,18 @@ Main menu - select an option:
 | 5 | Status / Health Check | Environment, role, Xray version, TUN device, profiles, `Table = off` audit, WireGuard handshake age, panel snippets, Cloudflare `cdn-cgi/trace` through the WARP interface, overall health |
 
 Every command is also available non-interactively (`warp-manager install`,
-`warp-manager remove`, ...).
+`warp-manager remove`, ...). Two extra CLI-only commands avoid a reinstall
+when only the panel config needs to change:
+
+```bash
+sudo warp-manager apply --panel-url https://panel.example.com \
+  --panel-user admin --panel-pass 'secret' --core-id 1 --yes
+sudo warp-manager unapply --panel-url https://panel.example.com \
+  --panel-user admin --panel-pass 'secret' --core-id 1 --yes
+```
+
+`apply` pushes the already-generated snippets into Core Settings (useful when
+the API login failed during the first install); `unapply` removes them.
 
 ---
 
