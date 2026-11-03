@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.14
+  PasarGuard WARP Manager  v1.0.15
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -569,7 +569,7 @@ use a real owner/admin account or provide the key manually.
 
 ---
 
-## Zero-credential key creation (1.0.14)
+## Zero-credential key creation (1.0.9)
 
 `warp-manager key`, `install` and `apply` no longer need you to paste a key or
 even type an admin password when the panel database runs on the same host:
@@ -598,7 +598,7 @@ outbound/rule order, and keeps `DIRECT` first.
 
 ---
 
-## Panel discovery when no host port is published (1.0.14)
+## Panel discovery when no host port is published (1.0.10)
 
 Some PasarGuard deployments run the panel API inside a Docker network with no
 published port, so `127.0.0.1:8000` and the domain both fail. `apply` now:
@@ -618,7 +618,7 @@ Overrides: `WARP_PANEL_CONTAINER=NAME` and `WARP_PANEL_TRANSPORT=nsenter`.
 
 ---
 
-## Reaching the panel API from inside its container (1.0.14)
+## Reaching the panel API from inside its container (1.0.11)
 
 PasarGuard has three official binding modes (`config.py` / `main.py`):
 
@@ -648,7 +648,7 @@ Overrides: `WARP_PANEL_EXEC_UDS`, `WARP_PANEL_EXEC_SCHEME`,
 
 ---
 
-## Why an added WARP outbound can break every config (1.0.14)
+## Why an added WARP outbound can break every config (1.0.12)
 
 Symptom: after `apply`, every client config shows `ping -1`; deleting the
 `warp` outbound and its routing rule immediately restores them. The order was
@@ -662,7 +662,7 @@ kernel WireGuard link and installs addresses, routes, sysctls and policy
 routing rules inside the node container. Those routes are global to the node and
 hijack traffic for every other inbound, so all clients go down.
 
-From 1.0.14 the generated outbound uses the current Xray schema:
+From 1.0.12 the generated outbound uses the current Xray schema:
 
 ```json
 {
@@ -710,7 +710,7 @@ create a new panel core.
 
 ---
 
-## Which server? (1.0.14 - corrected)
+## Which server? (1.0.13 - corrected)
 
 Run `warp-manager` on the **IRAN main panel server**, not on the foreign
 egress relay.
@@ -721,7 +721,7 @@ The Iran Core config has 12 separate inbounds (`... CloudFlare - CDN`,
 are merged into those 3 location inbounds. A WARP rule on the foreign core
 therefore applies to **every** user, which is why all configs dropped.
 
-From 1.0.14 `apply`:
+From 1.0.13 `apply`:
 
 * Finds the `... Tunnel ...` inbound tags in the target Core config.
 * Writes the WARP rule with `inboundTag: [those tags]` and **no** global
@@ -731,6 +731,9 @@ From 1.0.14 `apply`:
 * Keeps the userspace `noKernelTun: true` WARP outbound, node-health check and
   automatic rollback.
 
+The WARP decision still belongs on the Iran server, but from 1.0.15 the WARP
+tunnel itself terminates on the foreign server; see "Dedicated WARP link" below.
+
 See `docs/ARCHITECTURE.md` section 2.1 for the full two-core topology.
 
 ---
@@ -739,14 +742,18 @@ See `docs/ARCHITECTURE.md` section 2.1 for the full two-core topology.
 
 `api.cloudflareclient.com` (the wgcf registration API) is often blocked on
 Iranian hosts, so `install` fails there with a TLS handshake timeout. The
-WireGuard UDP endpoint is usually still reachable, so create the account once
-on the foreign server and reuse it on the main panel server:
+account can be created once on the foreign server and reused on the main panel
+server:
 
 ```bash
 sudo warp-manager export-profile                        # foreign server
 sudo warp-manager import-profile 'WARP1:...'            # main panel server
-sudo warp-manager apply --yes
 ```
+
+**Important (1.0.15):** on hosts where the WireGuard UDP endpoint is also
+filtered, do **not** run `apply` after importing: the WARP tunnel cannot be
+established from Iran and the tunnel configs hang. Use the dedicated WARP link
+below instead.
 
 `export-profile` prints one `WARP1:<base64>` line containing only the profile
 metadata (`meta.env` - private key, WARP addresses, peer public key, endpoint).
@@ -757,3 +764,35 @@ existing valid `meta.env` instead of calling `wgcf register` again.
 
 The install banner also no longer says "run on the foreign node"; it explains
 the corrected two-Core topology from `docs/ARCHITECTURE.md` section 2.1.
+
+---
+
+## Dedicated WARP link (1.0.15)
+
+WARP UDP to Cloudflare is filtered on Iranian hosts, so a `wireguard` outbound
+in the Iran Core hangs the tunnel configs. WARP must terminate on the **foreign**
+server, but a global rule there would capture every config (all 12 user configs
+merge into 3 inbounds). A private SOCKS link solves both:
+
+```bash
+# FOREIGN server (has a working WARP profile):
+sudo warp-manager update --yes
+sudo warp-manager warp-link          # prints ONE WARPLINK1: line
+
+# IRAN / MAIN PANEL server:
+sudo warp-manager update --yes
+sudo warp-manager warp-join 'WARPLINK1:...'
+```
+
+`warp-link` adds a private SOCKS inbound `WARP-LINK`, the userspace WARP
+outbound (before `BLOCK`), and a routing rule scoped to that inbound only.
+`warp-join` adds the matching SOCKS outbound (before `BLOCK`) and splits the
+`... Tunnel - ArvanCloud` tags out of the existing location rules, so only
+those configs use WARP. `cdn` / `direct` keep `Germany` / `NetherLands` /
+`Poland` and the three foreign IPs.
+
+Both commands take a Core backup first, are idempotent, and refuse to guess if
+several Core configs exist without a tunnel/relay match. The `WARPLINK1:` line
+contains the link password: keep it private.
+
+`status` no longer reports "Account file missing" for an imported WARP profile.

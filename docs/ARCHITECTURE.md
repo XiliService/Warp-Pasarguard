@@ -65,18 +65,44 @@ foreign server.
 | Cover `cdn` configs | IRAN main panel server | `xray` | Same core, different inbound tags |
 | Only produce JSON snippets | Any machine (or a laptop) | any | `--target generator --dry-run`, no host changes |
 
-**Answer to "which server?": the IRAN server.** All users, hosts and the 12
-inbounds live there; the foreign server is only an egress relay for the three
-IPs and must stay untouched. `warp-manager apply` now *refuses* to modify a
-Core config that has no `tunnel` inbound (a shared egress relay) unless
-`--all-traffic` is passed explicitly.
+**Answer to "which server?": BOTH, with different jobs.** The WARP *decision*
+belongs on the Iran main panel (only there are the 12 configs distinguishable),
+but the WARP *tunnel* belongs on the foreign server, because Cloudflare WARP is
+filtered on the Iranian host (`api.cloudflareclient.com` times out and UDP 2408
+does not complete a handshake). Putting a `wireguard` outbound in the Iran
+Core makes exactly the tunnel configs hang; putting a global WARP rule in the
+foreign Core affects every config.
 
-The earlier "foreign node" advice assumed a single gRPC node link where the
-Iran panel authors the Core config pushed to the foreign Xray. The real
-deployment uses a vless chain between two Core configs, so the WARP decision
-must be made on the Iran side where the categories are still distinguishable.
-WARP then exits from Cloudflare via the Iran node; `cdn` / `direct` configs
-continue to use the three foreign IPs.
+## 3.1 Dedicated WARP link (1.0.15, final design)
+
+A private SOCKS link joins the two Core configs, so WARP is used by the tunnel
+configs only:
+
+```
+  Iran core:  [DE/NL/PL] - Tunnel - ArvanCloud  --                                                   -> socks outbound WARP-LINK
+  Iran core:  [DE/NL/PL] - CDN / DC - Reality ----> Germany / NetherLands / Poland (unchanged)
+                                                          |
+                                   TCP (private port, user/pass)
+                                                          v
+  Foreign core: inbound WARP-LINK (socks) -> rule inboundTag=[WARP-LINK] -> warp
+  Foreign core: Germany / NetherLands / Poland -> Out-DE / Out-NL / Out-PL (unchanged)
+                                                          |
+                                                          v
+                                     Cloudflare WARP -> Internet
+```
+
+* `warp-manager warp-link` on the **foreign** server creates the SOCKS inbound,
+  the userspace WARP outbound, and a rule scoped to that inbound. It prints one
+  `WARPLINK1:` line with host/port/user/pass.
+* `warp-manager warp-join 'WARPLINK1:...'` on the **Iran** server adds the
+  matching SOCKS outbound and *splits* the tunnel inbound tags out of the
+  existing location rules, so only those three use WARP. It also removes any
+  leftover local `warp` outbound/rule.
+* `cdn` / `direct` configs keep the three foreign IPs. No other config, node
+  or inbound is touched.
+
+`warp-manager apply` still refuses a shared egress Core with no tunnel inbound
+unless `--all-traffic` is given.
 
 ## 4. What each backend changes
 

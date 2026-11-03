@@ -222,7 +222,7 @@ PostgreSQL/SQLite dump. Core Settings are also saved individually as
 
 ## `warp-manager: command not found` after `remove`
 
-Older versions removed the command on `remove --yes`. From 1.0.14 it is kept
+Older versions removed the command on `remove --yes`. From 1.0.8 it is kept
 unless `--uninstall-manager` is passed. If it is already gone, reinstall the
 bootstrap (the backup directory and `warp-manager.sh` are always preserved):
 
@@ -237,7 +237,7 @@ curl -fsSL -H 'Accept: application/vnd.github.raw' \
 ## `Created dedicated API key` but `no panel endpoint answered`
 
 The key was written to the panel database successfully; only the HTTP endpoint
-was unreachable. From 1.0.14 the script probes Docker bridge IPs and uses
+was unreachable. From 1.0.10 the script probes Docker bridge IPs and uses
 `nsenter` to reach the panel from inside its own container. Re-run:
 
 ```bash
@@ -252,7 +252,7 @@ containers. Make sure the `pasarguard/panel` container is actually running.
 
 ## All panel endpoints fail (33/36 candidates), key was created in the DB
 
-Do not remove or reinstall. From 1.0.14 the script runs curl **inside** the
+Do not remove or reinstall. From 1.0.11 the script runs curl **inside** the
 `pasarguard/panel` container, which supports `UVICORN_UDS`, TLS, and
 loopback-only listeners. Re-run:
 
@@ -271,7 +271,7 @@ Container discovery deliberately ignores `pgbouncer`, `pgadmin`,
 
 Do not remove the WARP outbound by hand as a permanent fix - that disables WARP.
 The cause was Xray choosing **kernel TUN** because the node has CAP_NET_ADMIN;
-it installs global routes/ip rules and breaks every other inbound. From 1.0.14
+it installs global routes/ip rules and breaks every other inbound. From 1.0.12
 the outbound uses `noKernelTun: true` (userspace), which cannot affect other
 traffic.
 
@@ -296,7 +296,7 @@ You are applying WARP to the **foreign relay** Core config. It has only 4
 inbounds (`Germany`, `NetherLands`, `Poland`, `SOCKS5`); all 12 user configs
 funnel into them, so any WARP rule affects everyone. Do not use `--all-traffic`.
 
-Install/run the script on the **IRAN main panel server** instead. From 1.0.14
+Install/run the script on the **IRAN main panel server** instead. From 1.0.13
 `apply` detects the `... Tunnel - ArvanCloud` inbounds there and scopes WARP to
 those only, leaving `cdn` / `direct` configs on the three foreign IPs. The
 foreign server must stay untouched.
@@ -333,3 +333,31 @@ an existing/imported profile from now on instead of registering a new account.
 
 The `WARP1:` line contains the WireGuard private key. Keep it private and
 delete it from your terminal history afterwards.
+
+---
+
+## Tunnel configs disconnect as soon as WARP is applied on the Iran server
+
+Cloudflare WARP is filtered on this host: `api.cloudflareclient.com` TLS
+handshake times out and UDP 2408 to `engage.cloudflareclient.com` never
+completes a handshake. The scoped `inboundTag` rule worked (only the tunnel
+configs were affected, `cdn`/`direct` stayed up), but the WARP tunnel itself
+cannot be established from Iran. Removing the WARP outbound/rule restores
+pings, as observed.
+
+Do not add a `wireguard` outbound to the Iran Core again. Use the dedicated
+link instead, so WARP terminates on the foreign server while only the tunnel
+configs are routed to it:
+
+```bash
+# FOREIGN server
+sudo warp-manager update --yes
+sudo warp-manager warp-link
+
+# IRAN server
+sudo warp-manager update --yes
+sudo warp-manager warp-join 'WARPLINK1:...'
+sudo warp-manager status
+```
+
+Both sides keep `BLOCK` as the trailing outbound and the leading routing rule.

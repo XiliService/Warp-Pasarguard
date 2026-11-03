@@ -1105,6 +1105,101 @@ check "--yes never opens an interactive Core selector" \
   bash -c "sed -n '/^apply_to_panel()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'ASSUME_YES'"
 
 # ---------------------------------------------------------------------------
+printf '\n[8o] Dedicated WARP link (foreign egress, Iran main panel)\n'
+cat >"$WORK/link-iran-core.json" <<'JSON'
+{"id":1,"name":"Default Core Config","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],
+"config":{
+"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"[NL] - Tunnel - ArvanCloud","protocol":"vless","port":33613}],
+"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"warp","protocol":"wireguard"},{"tag":"Germany","protocol":"vless"},{"tag":"BLOCK","protocol":"blackhole"}],
+"routing":{"rules":[
+{"type":"field","outboundTag":"BLOCK"},
+{"type":"field","inboundTag":["[DE] - CloudFlare - CDN","[DE] - Tunnel - ArvanCloud"],"outboundTag":"Germany"},
+{"type":"field","outboundTag":"warp","domain":["ipinfo.io"]}]}}}
+JSON
+linkblob="$(printf '%s' '{"host":"95.135.200.231","port":31234,"user":"warpu","pass":"passw","tag":"WARP-LINK"}' | base64 -w0)"
+join_put="$WORK/join-put.json"
+CORE_FILE="$WORK/link-iran-core.json" OUT_FILE="$join_put" LINK_BLOB="$linkblob" \
+WARP_APP_DIR="$WORK/join-app" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  state_set PANEL_API_KEY pg_key_test; state_set PANEL_URL "http://127.0.0.1:8000"
+  PANEL_CORE_ID=""
+  panel_login() { return 0; }
+  confirm() { return 0; }
+  panel_api() {
+    local m="$1" p="$2" b="${3:-}"
+    if [[ "$m" == GET && "$p" == "/cores" ]]; then
+      PANEL_API_BODY="{\"count\":1,\"cores\":[{\"id\":1,\"name\":\"Default Core Config\"}]}"; return 0; fi
+    if [[ "$m" == GET && "$p" == /core/* ]]; then
+      PANEL_API_BODY="$(cat "$CORE_FILE")"; return 0; fi
+    if [[ "$m" == PUT ]]; then printf "%s" "$b" > "$OUT_FILE"; PANEL_API_BODY="{}"; return 0; fi
+    return 0
+  }
+  cmd_warp_join "$LINK_BLOB" >/dev/null 2>&1 || true' 2>/dev/null || true
+check "warp-join sends a valid Core config PUT" \
+  bash -c "jq -e '.config.outbounds' '$join_put' >/dev/null"
+check "warp-join routes only tunnel inbounds to WARP-LINK" \
+  bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"WARP-LINK\") | .inboundTag[]] | all(test(\"Tunnel\"))' '$join_put' >/dev/null"
+check "warp-join keeps cdn/direct on their location outbound" \
+  bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"Germany\") | .inboundTag[]] == [\"[DE] - CloudFlare - CDN\"]' '$join_put' >/dev/null"
+check "warp-join removes the broken local warp outbound" \
+  bash -c "jq -e '[.config.outbounds[] | select(.tag==\"warp\")] | length == 0' '$join_put' >/dev/null"
+check "warp-join removes the old global WARP domain rule" \
+  bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"warp\")] | length == 0' '$join_put' >/dev/null"
+check "warp-join inserts the link outbound before BLOCK" \
+  bash -c "jq -e '[.config.outbounds[].tag] | index(\"WARP-LINK\") < index(\"BLOCK\")' '$join_put' >/dev/null"
+check "warp-link creates a scoped inbound rule (source check)" \
+  bash -c "sed -n '/^cmd_warp_link()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'inboundTag: \[\$tag\]'"
+check "--help documents warp-link / warp-join" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- 'warp-join'"
+
+# ---------------------------------------------------------------------------
+printf '\n[8p] warp-link on the foreign relay\n'
+cat >"$WORK/link-foreign-core.json" <<'JSON'
+{"id":1,"name":"Kharej","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],
+"config":{"inbounds":[{"tag":"Germany","protocol":"vless","port":64483},{"tag":"SOCKS5","protocol":"socks","port":16356}],
+"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Out-DE","protocol":"freedom"},{"tag":"BLOCK","protocol":"blackhole"}],
+"routing":{"rules":[{"type":"field","outboundTag":"BLOCK"},{"type":"field","inboundTag":["Germany"],"outboundTag":"Out-DE"},{"type":"field","inboundTag":["SOCKS5"],"outboundTag":"Out-DE"}]}}}
+JSON
+link_put="$WORK/link-put.json"
+CORE_FILE="$WORK/link-foreign-core.json" OUT_FILE="$link_put" \
+WARP_APP_DIR="$WORK/link-app" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  state_set PANEL_API_KEY pg_key_test; state_set PANEL_URL "http://127.0.0.1:8000"
+  state_set PROFILES default
+  profile_meta_set default PRIVATE_KEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  profile_meta_set default ADDRESS4 "172.16.0.2/32"
+  profile_meta_set default ADDRESS6 ""
+  profile_meta_set default PUBLIC_KEY "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo="
+  profile_meta_set default ENDPOINT "engage.cloudflareclient.com:2408"
+  profile_meta_set default TAG "warp"
+  PANEL_CORE_ID=""
+  panel_login() { return 0; }
+  confirm() { return 0; }
+  ensure_api_key() { return 0; }
+  panel_api() {
+    local m="$1" p="$2" b="${3:-}"
+    if [[ "$m" == GET && "$p" == "/cores" ]]; then
+      PANEL_API_BODY="{\"count\":1,\"cores\":[{\"id\":1,\"name\":\"Kharej\"}]}"; return 0; fi
+    if [[ "$m" == GET && "$p" == /core/* ]]; then
+      PANEL_API_BODY="$(cat "$CORE_FILE")"; return 0; fi
+    if [[ "$m" == PUT ]]; then printf "%s" "$b" > "$OUT_FILE"; PANEL_API_BODY="{}"; return 0; fi
+    return 0
+  }
+  cmd_warp_link >/dev/null 2>&1 || true' 2>/dev/null || true
+check "warp-link sends a valid Core config PUT" \
+  bash -c "jq -e '.config.outbounds' '$link_put' >/dev/null"
+check "warp-link adds the WARP outbound before BLOCK" \
+  bash -c "jq -e '[.config.outbounds[].tag] | index(\"warp\") < index(\"BLOCK\")' '$link_put' >/dev/null"
+check "warp-link creates a private WARP-LINK socks inbound" \
+  bash -c "jq -e '[.config.inbounds[] | select(.tag==\"WARP-LINK\") | .protocol] == [\"socks\"]' '$link_put' >/dev/null"
+check "warp-link scopes WARP to that inbound only" \
+  bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"warp\") | .inboundTag[]] == [\"WARP-LINK\"]' '$link_put' >/dev/null"
+check "warp-link leaves the location rules untouched" \
+  bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"Out-DE\")] | length == 2' '$link_put' >/dev/null"
+check "warp-link WARP outbound is userspace" \
+  bash -c "jq -e '.config.outbounds[] | select(.tag==\"warp\") | .settings.noKernelTun == true' '$link_put' >/dev/null"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \

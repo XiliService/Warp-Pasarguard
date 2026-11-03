@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.14"
+readonly SCRIPT_VERSION="1.0.15"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -93,6 +93,7 @@ REMOVE_ALL=0
 ALL_TRAFFIC=0
 WARP_TUNNEL_TAGS="[]"
 PROFILE_BLOB=""
+WARP_LINK_BLOB=""
 BINDING_PRESET="${WARP_BINDING:+1}"
 BINDING_PRESET="${BINDING_PRESET:-0}"
 
@@ -2677,6 +2678,225 @@ cmd_import_profile() {
   return 0
 }
 
+# -----------------------------------------------------------------------------
+# Dedicated WARP link: WARP terminates on the FOREIGN server (where Cloudflare
+# is reachable) but only the "tunnel" configs on the IRAN main panel use it.
+#
+# warp-link  (foreign server): adds a private SOCKS inbound + WARP outbound and
+#            a rule scoped to that inbound. No other config is touched.
+# warp-join  (Iran server):    adds a SOCKS outbound to that inbound and splits
+#            the tunnel inbound tags out of the existing location rules.
+# -----------------------------------------------------------------------------
+WARP_LINK_TAG="WARP-LINK"
+
+panel_put_core() {
+  local core_id="$1" snapshot="$2" merged="$3" body
+  body="$(jq -n --slurpfile c "$snapshot" --slurpfile cfg "$merged" '{
+      name: ($c[0].name),
+      config: $cfg[0],
+      type: ($c[0].type // null),
+      exclude_inbound_tags: ($c[0].exclude_inbound_tags // []),
+      fallbacks_inbound_tags: ($c[0].fallbacks_inbound_tags // [])
+    }')" || return 1
+  panel_api PUT "/core/${core_id}?restart_nodes=true" "$body" || return 1
+  return 0
+}
+
+panel_authed_core() {
+  local want_tunnel="$1" cid best=""
+  panel_login || return 1
+  panel_api GET "/cores" || return 1
+  local -a ids=()
+  while IFS= read -r cid; do [[ -n "$cid" ]] && ids+=("$cid"); done \
+    < <(jq -r '.cores[]? | .id' <<<"$PANEL_API_BODY" 2>/dev/null)
+  (( ${#ids[@]} > 0 )) || return 1
+  for cid in "${ids[@]}"; do
+    panel_api GET "/core/${cid}" 2>/dev/null || continue
+    local has
+    has="$(jq -r '[ (.config.inbounds // [])[] | .tag // empty
+                    | select(ascii_downcase | test("tunnel")) ] | length' \
+          <<<"$PANEL_API_BODY" 2>/dev/null || echo 0)"
+    if [[ "$want_tunnel" == "1" && "$has" != "0" ]] || \
+       [[ "$want_tunnel" == "0" && "$has" == "0" ]]; then
+      best="$cid"; break
+    fi
+  done
+  [[ -n "$best" ]] || best="${ids[0]}"
+  printf '%s' "$best"
+  return 0
+}
+
+cmd_warp_link() {
+  state_init
+  load_saved_api_key; load_saved_panel_url
+  have jq || die "jq is required."
+  local names; names="$(profile_list)"
+  [[ -n "$names" ]] || die "No WARP profile on this host. Run 'warp-manager install' or 'import-profile' first."
+  local -a profiles=(); read -r -a profiles <<<"$names"
+  MODE="xray"; ROUTING="domains"; DOMAINS_CSV="$DEFAULT_DOMAINS"; MODERN_XRAY=1
+  build_snippets "${profiles[@]}" >/dev/null || die "Could not build the WARP outbound."
+  header "$APP_NAME v$SCRIPT_VERSION - Create dedicated WARP link (FOREIGN server)"
+  [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
+  local core_id; core_id="$(panel_authed_core 0)" || die "Panel API is unreachable."
+  info "Using Core config ${core_id} on this egress relay."
+  panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
+  local snapshot="$BACKUP_DIR/warp-link-core-${core_id}-$(now_tag).json"
+  printf '%s\n' "$PANEL_API_BODY" | jq . >"$snapshot"; chmod 600 "$snapshot"
+  info "Core backup saved: ${snapshot}"
+
+  local port user pass host used
+  used="$(jq -r '[ (.config.inbounds // [])[] | .port // empty ] | join(",")' "$snapshot" 2>/dev/null || true)"
+  port="$(( 20000 + RANDOM % 20000 ))"
+  while [[ ",$used," == *",$port,"* ]]; do port="$(( 20000 + RANDOM % 20000 ))"; done
+  user="warp$(printf '%04x' "$RANDOM")"
+  pass="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
+  host="${WARP_LINK_HOST:-}"
+  if [[ -z "$host" ]] && have ip; then
+    host="$(ip -4 route get 1.1.1.1 2>/dev/null \
+            | awk '{ for (i=1; i<=NF; i++) if ($i == "src") print $(i+1) }' | head -n1 || true)"
+  fi
+  [[ -n "$host" ]] || host="$PRIMARY_IP"
+  [[ -n "$host" ]] || host="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  [[ -n "$host" ]] || die "Could not determine this server's IP (set WARP_LINK_HOST)."
+
+  local obs merged
+  obs="$(cat "$OUTPUT_DIR/outbounds.json")"
+  merged="$(mktemp)"
+  if ! jq --argjson obs "$obs" --argjson port "$port" --arg user "$user" \
+       --arg pass "$pass" --arg tag "$WARP_LINK_TAG" '
+     .config
+     | .outbounds = ([ (.outbounds // [])[]
+         | select(((.tag // "") != "warp") and ((.tag // "") != $tag)) ])
+     | .inbounds  = ([ (.inbounds  // [])[]
+         | select((.tag // "") != $tag) ])
+     | .routing = (.routing // {})
+     | .routing.rules = ([ (.routing.rules // [])[]
+         | select( ((.outboundTag // "") != "warp")
+                   and (([(.inboundTag // [])[]] | index($tag)) == null) ) ])
+     | (.outbounds) as $o
+     | ([ range(0; ($o|length)) as $i
+          | select( (($o[$i] | (.tag // "") | ascii_downcase | test("block|blackhole")))
+                    or (($o[$i] | (.protocol // "") | ascii_downcase | test("blackhole"))) )
+          | $i ] | min // ($o|length)) as $cut
+     | .outbounds = ($o[0:$cut] + $obs + $o[$cut:])
+     | .inbounds = (.inbounds + [{
+         tag: $tag, protocol: "socks", port: $port, listen: "0.0.0.0",
+         settings: { auth: "password", accounts: [{ user: $user, pass: $pass }],
+                     udp: true, ip: "0.0.0.0" }
+       }])
+     | (.routing.rules) as $r
+     | ([ range(0; ($r|length)) as $i
+          | select((($r[$i] | (.outboundTag // "") | ascii_downcase
+                     | test("block|blackhole")) | not)) | $i ]
+        | min // ($r|length)) as $rcut
+     | .routing.rules = ($r[0:$rcut]
+         + [{ type: "field", inboundTag: [$tag], outboundTag: "warp" }]
+         + $r[$rcut:])
+   ' "$snapshot" >"$merged"; then
+    rm -f -- "$merged"; die "Could not build the WARP link config."
+  fi
+  if ! confirm "Apply the dedicated WARP link to Core ${core_id} now?"; then
+    warn "Skipped. Preview: ${merged}"; return 0
+  fi
+  if ! panel_put_core "$core_id" "$snapshot" "$merged"; then
+    error "Panel update failed. Restore from ${snapshot}"; rm -f -- "$merged"; return 1
+  fi
+  state_set_many "WARP_LINK_HOST=$host" "WARP_LINK_PORT=$port" \
+    "WARP_LINK_USER=$user" "WARP_LINK_PASS=$pass" "WARP_LINK_CORE=$core_id"
+  local blob
+  blob="$(jq -cn --arg h "$host" --argjson p "$port" --arg u "$user" \
+      --arg s "$pass" --arg t "$WARP_LINK_TAG" \
+      '{host:$h,port:$p,user:$u,pass:$s,tag:$t}' | base64 -w0)"
+  warn "This line contains the link password. Keep it private."
+  printf '\nWARPLINK1:%s\n\n' "$blob"
+  ok "Dedicated WARP link created on port ${port}. ONLY traffic sent to this link uses WARP."
+  info "The link listens on ${host}:${port} (TCP). If a firewall on the FOREIGN host filters it, allow that port; the node container uses host networking."
+  info "On the IRAN main panel server run: warp-manager warp-join 'WARPLINK1:<line above>'"
+  rm -f -- "$merged"
+  return 0
+}
+
+cmd_warp_join() {
+  local blob="${1:-}" link
+  [[ -n "$blob" ]] || die "Usage: warp-manager warp-join 'WARPLINK1:...'"
+  state_init
+  load_saved_api_key; load_saved_panel_url
+  have jq || die "jq is required."
+  link="$(printf '%s' "$blob" | base64 -d 2>/dev/null)" || die "Invalid link data."
+  jq -e '.host and .port and .user and .pass and .tag' <<<"$link" >/dev/null 2>&1 \
+    || die "Invalid link data (missing host/port/user/pass/tag)."
+  header "$APP_NAME v$SCRIPT_VERSION - Join dedicated WARP link (MAIN PANEL server)"
+  local lh lp
+  lh="$(jq -r .host <<<"$link")"; lp="$(jq -r .port <<<"$link")"
+  if ! timeout 4 bash -c 'exec 3<>/dev/tcp/$1/$2' _ "$lh" "$lp" 2>/dev/null; then
+    die "The WARP link ${lh}:${lp} is not reachable from this server. Open TCP ${lp} on the FOREIGN server / node container, then retry."
+  fi
+  ok "WARP link ${lh}:${lp} is reachable from this server."
+  [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
+  local core_id; core_id="$(panel_authed_core 1)" || die "Panel API is unreachable."
+  info "Using Core config ${core_id} (it has the tunnel inbounds)."
+  panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
+  local snapshot="$BACKUP_DIR/warp-join-core-${core_id}-$(now_tag).json"
+  printf '%s\n' "$PANEL_API_BODY" | jq . >"$snapshot"; chmod 600 "$snapshot"
+  info "Core backup saved: ${snapshot}"
+
+  local merged; merged="$(mktemp)"
+  if ! jq --argjson link "$link" '
+     def tun: [ (.inboundTag // [])[]
+               | select(ascii_downcase | test("tunnel")) ];
+     .config
+     | .outbounds = ([ (.outbounds // [])[]
+         | select(((.tag // "") != "warp") and ((.tag // "") != $link.tag)) ])
+     | .routing = (.routing // {})
+     | ([ (.routing.rules // [])[]
+          | select( ((.outboundTag // "") != "warp")
+                    and ((.outboundTag // "") != $link.tag)
+                    and ((.balancerTag // "") != $link.tag) )
+          | . as $rule
+          | (tun) as $t
+          | if ($t | length) > 0 then
+              ({ type: "field", inboundTag: $t, outboundTag: $link.tag }),
+              ($rule | .inboundTag = ((.inboundTag // []) - $t)
+                     | del(.balancerTag))
+            else $rule end
+          | select( if has("inboundTag") then (.inboundTag | length) > 0
+                    else true end )
+       ]) as $newrules
+     | .routing.rules = $newrules
+     | (.outbounds) as $o
+     | ([ range(0; ($o|length)) as $i
+          | select( (($o[$i] | (.tag // "") | ascii_downcase | test("block|blackhole")))
+                    or (($o[$i] | (.protocol // "") | ascii_downcase | test("blackhole"))) )
+          | $i ] | min // ($o|length)) as $cut
+     | .outbounds = ($o[0:$cut] + [{
+         tag: $link.tag, protocol: "socks",
+         settings: { servers: [{
+           address: $link.host, port: $link.port,
+           users: [{ user: $link.user, pass: $link.pass }]
+         }] }
+       }] + $o[$cut:])
+   ' "$snapshot" >"$merged"; then
+    rm -f -- "$merged"; die "Could not build the joined Core config."
+  fi
+  local nrules
+  nrules="$(jq --arg t "$WARP_LINK_TAG" \
+      '[ .routing.rules[] | select(.outboundTag == $t) ] | length' \
+      "$merged" 2>/dev/null || echo 0)"
+  if ! confirm "Apply the WARP link to ${core_id} now?"; then
+    warn "Skipped. Preview: ${merged}"; return 0
+  fi
+  if ! panel_put_core "$core_id" "$snapshot" "$merged"; then
+    error "Panel update failed. Restore from ${snapshot}"; rm -f -- "$merged"; return 1
+  fi
+  state_set_many "WARP_LINK_HOST=$(jq -r .host <<<"$link")" \
+    "WARP_LINK_PORT=$(jq -r .port <<<"$link")" \
+    "WARP_LINK_CORE=$core_id" "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  ok "Only the tunnel inbounds now use the WARP link (${nrules} rule(s))."
+  info "cdn / direct configs keep their three foreign IPs unchanged."
+  rm -f -- "$merged"
+  return 0
+}
+
 cmd_apply() {
   local action="${1:-apply}"
   state_init
@@ -3221,7 +3441,13 @@ cmd_status() {
     src="$(profile_meta "$n" SRC_IP system-default)"
     ep="$(profile_meta "$n" ENDPOINT "$DEFAULT_ENDPOINT")"
     printf '  %-14s tag=%-14s iface=%-12s src=%-16s ep=%s\n' "$n" "$tag" "$iface" "$src" "$ep"
-    [[ -f "$PROFILE_DIR/$n/wgcf-account.toml" ]] || { warn "  Account file missing for ${n}."; problems=$((problems + 1)); }
+    if [[ ! -f "$PROFILE_DIR/$n/wgcf-account.toml" ]]; then
+      if [[ "$(state_get PROFILE_IMPORTED 0)" == "1" ]]; then
+        ok "  Reused WARP account (imported profile; no wgcf account file needed)."
+      else
+        warn "  Account file missing for ${n}."; problems=$((problems + 1))
+      fi
+    fi
     if [[ "$mode" == "kernel" ]]; then
       if [[ -f "$WG_DIR/$iface.conf" ]]; then
         if grep -q '^Table = off' "$WG_DIR/$iface.conf"; then ok "  ${iface}.conf has Table = off (SSH safe)."
@@ -3382,10 +3608,14 @@ Commands:
   key         Create/reuse the dedicated Panel API key
   export-profile  Print the WARP profile as one WARP1: line (private!)
   import-profile 'WARP1:...'  Reuse an existing WARP account, no Cloudflare call
+  warp-link       (FOREIGN server) create a dedicated WARP link; prints WARPLINK1:
+  warp-join 'WARPLINK1:...'  (MAIN PANEL server) route tunnel configs to it
   help        Show this help
 
 Server selection: install on the MAIN PANEL server (Iran), where the user
-  inbounds live. Do NOT install on a shared egress relay: apply refuses it.
+  inbounds live. Do NOT add a local WARP outbound there: Cloudflare WARP is
+  filtered on Iranian hosts. Instead run warp-link on the FOREIGN server and
+  warp-join on the Iran server, so only the tunnel configs use WARP.
   See docs/ARCHITECTURE.md section 2.1.
 
 Install options:
@@ -3438,6 +3668,7 @@ Environment variables:
   WARP_APP_DIR, WARP_BRANCH, WARP_UPDATE_URL, WARP_MODE, WARP_TARGET,
   WARP_PANEL_CONTAINER, WARP_PANEL_TRANSPORT (docker-exec / nsenter / direct),
   WARP_PANEL_EXEC_UDS, WARP_PANEL_EXEC_SCHEME, WARP_PANEL_EXEC_PORT,
+  WARP_LINK_HOST        Override the IP published by warp-link
   WARP_BINDING, WARP_SRC_IP, WARP_LABEL, WARP_LABELS, WARP_ENDPOINT, WARP_ROUTING,
   WARP_DOMAINS, WARP_LICENSE_KEY, WARP_APPLY_PANEL, WGCF_VERSION,
   WARP_YES, WARP_DRY_RUN, WARP_FORCE, WARP_INSECURE, WARP_DEBUG,
@@ -3458,8 +3689,9 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key|export-profile|import-profile) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key|export-profile|import-profile|warp-link|warp-join) COMMAND="$1"; shift ;;
       WARP1:*) PROFILE_BLOB="${1#WARP1:}"; shift ;;
+      WARPLINK1:*) WARP_LINK_BLOB="${1#WARPLINK1:}"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -3569,6 +3801,8 @@ main() {
     key)       require_root; cmd_key ;;
     export-profile) require_root; cmd_export_profile ;;
     import-profile) require_root; cmd_import_profile "$PROFILE_BLOB" ;;
+    warp-link) require_root; cmd_warp_link ;;
+    warp-join) require_root; cmd_warp_join "$WARP_LINK_BLOB" ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac
