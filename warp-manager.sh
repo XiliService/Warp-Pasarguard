@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.8"
+readonly SCRIPT_VERSION="1.0.9"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -74,7 +74,7 @@ PANEL_PASS="${PANEL_PASS:-}"
 PANEL_API_KEY="${PANEL_API_KEY:-}"
 PANEL_AUTH_MODE="token"
 PANEL_KEY_NAME="warp-manager"
-RESTORE_DB="0"; AUTO_KEY="0"; RESTORE_PATH=""
+RESTORE_DB="0"; AUTO_KEY="0"; RESTORE_PATH=""; UNINSTALL_MANAGER="0"
 PANEL_TOKEN="${PANEL_TOKEN:-}"
 PANEL_CORE_ID="${PANEL_CORE_ID:-}"
 APPLY_PANEL="${WARP_APPLY_PANEL:-auto}"
@@ -1183,6 +1183,14 @@ load_saved_api_key() {
   return 0
 }
 
+load_saved_panel_url() {
+  if [[ -z "$PANEL_URL" ]]; then
+    local u; u="$(state_get PANEL_URL '')"
+    if [[ -n "$u" ]]; then PANEL_URL="$u"; fi
+  fi
+  return 0
+}
+
 # Read-only probe: PasarGuard accepts an API key via the X-Api-Key header
 # (Authorization: ApiKey <key> also works). A valid /api/cores response is
 # {"count":N,"cores":[...]}, which lets us identify the correct panel URL.
@@ -1223,8 +1231,16 @@ local_panel_urls() {
     [[ -n "$name" ]] || continue
     image="$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || true)"
     [[ "$image" == *pasarguard/panel* ]] || continue
+    local uvicorn_port
+    uvicorn_port="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+                   | grep '^UVICORN_PORT=' | head -n1 | cut -d= -f2- || true)"
+    if [[ "$uvicorn_port" =~ ^[0-9]+$ ]]; then
+      printf 'http://127.0.0.1:%s\n' "$uvicorn_port"
+    fi
     ports="$(docker inspect "$name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null || true)"
-    [[ -n "$ports" && "$ports" != "null" && "$ports" != "{}" ]] || continue
+    if [[ -z "$ports" || "$ports" == "null" || "$ports" == "{}" ]]; then
+      continue
+    fi
     while IFS= read -r port; do
       if [[ "$port" =~ ^[0-9]+$ ]]; then printf 'http://127.0.0.1:%s\n' "$port"; fi
     done < <(jq -r 'to_entries[] | .value[]? | .HostPort // empty' <<<"$ports" 2>/dev/null)
@@ -1323,7 +1339,10 @@ panel_login() {
     PANEL_ACCESS_TOKEN="$PANEL_TOKEN"
     return 0
   fi
-  [[ -n "$PANEL_URL" ]] || { error "Panel URL is required."; return 1; }
+  if [[ -z "$PANEL_URL" && "$ALLOW_LOCAL_PANEL" != "1" ]]; then
+    error "Panel URL is required. Use --panel-url URL."
+    return 1
+  fi
   if [[ -z "$PANEL_USER" ]]; then
     PANEL_USER="$(ui_read "Panel admin username: ")" || return 1
   fi
@@ -1331,8 +1350,9 @@ panel_login() {
     PANEL_PASS="$(ui_read_secret "Panel admin password: ")" || return 1
   fi
 
-  local configured="$PANEL_URL" b url pass k configured_err="" auth_rejected=""
-  local -a urls=("$configured") passes=(1)
+  local configured="${PANEL_URL:-}" b url pass k configured_err="" auth_rejected=""
+  local -a urls=() passes=(1)
+  if [[ -n "$configured" ]]; then urls+=("$configured"); fi
   [[ "$INSECURE" == "1" ]] || passes+=(2)
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
@@ -1351,13 +1371,15 @@ panel_login() {
     fi
     for url in "${urls[@]}"; do
       k=0; [[ "$pass" == "2" || "$INSECURE" == "1" ]] && k=1
-      if [[ "$url" != "$configured" ]]; then
+      if [[ -n "$configured" && "$url" != "$configured" ]]; then
         if [[ "$ALLOW_LOCAL_PANEL" != "1" ]]; then
           info "Skipping local panel ${url} (pass --allow-local-panel to use it)."
           continue
         fi
         warn "Using the LOCAL panel at ${url} because ${configured} is unreachable."
         warn "Make sure this is the panel that manages your users."
+      elif [[ -z "$configured" && "$ALLOW_LOCAL_PANEL" != "1" ]]; then
+        continue
       fi
       if panel_try_login "$url" "$k"; then
         PANEL_URL="$url"; INSECURE="$k"
@@ -1843,12 +1865,6 @@ cmd_install() {
     normalize_perip
   fi
 
-  if [[ "$APPLY_PANEL" != "no" && -z "$PANEL_API_KEY" && -n "$PANEL_USER" && -n "$PANEL_PASS" ]]; then
-    if ! ensure_api_key; then
-      warn "Continuing without an API key; snippets will be written for manual paste."
-    fi
-  fi
-
   local -a names=() srcs=() eps=()
   local i
   if [[ "$BINDING" == "per-ip" ]]; then
@@ -1884,6 +1900,12 @@ cmd_install() {
   if [[ -n "$pre_install_backup" ]]; then
     ok "Full backup taken before install: ${pre_install_backup}"
     ok "Restore with: warp-manager restore ${pre_install_backup}"
+  fi
+
+  if [[ "$APPLY_PANEL" != "no" && -z "$PANEL_API_KEY" ]]; then
+    if ! ensure_api_key; then
+      warn "Continuing without an API key; snippets will be written for manual paste."
+    fi
   fi
 
   install_packages
@@ -1934,8 +1956,67 @@ TXT
 # -----------------------------------------------------------------------------
 # Dedicated API key: create ONCE, verify and reuse across all versions
 # -----------------------------------------------------------------------------
+# Create the dedicated key directly in the panel database. Used when no admin
+# session is available (e.g. an env-only admin or a proxied dashboard domain).
+# The panel stores key_hash as "v1$<b64url(sha256[:16])>$sha256$<sha256hex>".
+create_api_key_via_db() {
+  have docker || return 1
+  have python3 || return 1
+  local dbc env_json user pass dbname uuid raw lookup trimmed admin_id sql
+  dbc="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+        | awk '$2 ~ /timescale|postgres/ {print $1; exit}')"
+  [[ -n "$dbc" ]] || return 1
+  env_json="$(docker inspect "$dbc" --format '{{json .Config.Env}}' 2>/dev/null || true)"
+  [[ -n "$env_json" && "$env_json" != "null" ]] || return 1
+  user=""; pass=""; dbname=""
+  if have jq; then
+    user="$(jq -r '.[]? | select(startswith("POSTGRES_USER=")) | ltrimstr("POSTGRES_USER=")' <<<"$env_json" | head -n1)"
+    pass="$(jq -r '.[]? | select(startswith("POSTGRES_PASSWORD=")) | ltrimstr("POSTGRES_PASSWORD=")' <<<"$env_json" | head -n1)"
+    dbname="$(jq -r '.[]? | select(startswith("POSTGRES_DB=")) | ltrimstr("POSTGRES_DB=")' <<<"$env_json" | head -n1)"
+  fi
+  [[ -n "$user" ]] || user="postgres"
+  [[ -n "$dbname" ]] || dbname="pasarguard"
+
+  admin_id="$(docker exec -e PGPASSWORD="$pass" "$dbc" psql -U "$user" -d "$dbname" -tAc \
+      'SELECT id FROM admins ORDER BY id LIMIT 1' 2>/dev/null | tr -d '[:space:]')"
+  if [[ ! "$admin_id" =~ ^[0-9]+$ ]]; then return 1; fi
+
+  uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')" || return 1
+  local -a parts=()
+  while IFS= read -r line; do parts+=("$line"); done < <(python3 - "$uuid" <<'PYHASH'
+import sys, hashlib, base64
+u = sys.argv[1]
+raw = "pg_key_" + u
+d = hashlib.sha256(raw.encode()).digest()
+lookup = base64.urlsafe_b64encode(d[:16]).decode().rstrip("=")
+hexd = hashlib.sha256(raw.encode()).hexdigest()
+print(raw)
+print("v1$%s$sha256$%s" % (lookup, hexd))
+print("pg_key_%s***%s" % (u[:3], u[-3:]))
+PYHASH
+)
+  [[ ${#parts[@]} -eq 3 ]] || return 1
+  raw="${parts[0]}"; lookup="${parts[1]}"; trimmed="${parts[2]}"
+
+  # All values are generated internally; no user input reaches this SQL.
+  sql="BEGIN;
+DELETE FROM api_keys WHERE name = '${PANEL_KEY_NAME}';
+INSERT INTO api_keys (admin_id, name, key_hash, api_key_trimmed, permissions, inherit_permissions, note, status, created_at)
+VALUES (${admin_id}, '${PANEL_KEY_NAME}', '${lookup}', '${trimmed}', '{}'::jsonb, TRUE, 'Created by WARP Manager; reused across versions', 'active', NOW());
+COMMIT;"
+  if ! printf '%s\n' "$sql" | docker exec -i -e PGPASSWORD="$pass" "$dbc" \
+       psql -U "$user" -d "$dbname" -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
+    return 1
+  fi
+  printf '%s' "$raw"
+  return 0
+}
+
+# Dedicated API key: create ONCE, verify and reuse across all versions.
+# Order: saved key -> official API with admin credentials -> local database.
 ensure_api_key() {
   load_saved_api_key
+  load_saved_panel_url
   if [[ -n "$PANEL_API_KEY" ]]; then
     if panel_login >/dev/null 2>&1; then
       info "Reusing the existing dedicated API key '${PANEL_KEY_NAME}'."
@@ -1944,64 +2025,72 @@ ensure_api_key() {
     warn "Stored API key is no longer valid; creating a new one."
   fi
 
-  if [[ -z "$PANEL_USER" ]]; then
-    PANEL_USER="$(ui_read "Panel admin username (used ONCE to create a dedicated API key): ")" || return 1
-  fi
-  if [[ -z "$PANEL_PASS" ]]; then
-    PANEL_PASS="$(ui_read_secret "Panel admin password (used once, never stored): ")" || return 1
-  fi
+  local stale="$PANEL_API_KEY" session_out="" created=""
   if [[ -z "$PANEL_USER" || -z "$PANEL_PASS" ]]; then
-    error "Admin credentials are needed once to create an API key."
-    warn "Or create a key in Panel -> API Keys and pass --panel-key pg_key_... ."
-    return 1
+    if [[ "$ASSUME_YES" != "1" && -r /dev/tty ]]; then
+      PANEL_USER="$(ui_read "Panel admin username (used ONCE; Enter to skip): ")" || PANEL_USER=""
+      if [[ -n "$PANEL_USER" ]]; then
+        PANEL_PASS="$(ui_read_secret "Panel admin password (used once, never stored): ")" || PANEL_PASS=""
+      fi
+    fi
   fi
-
-  local stale="$PANEL_API_KEY" saved_allow="$ALLOW_LOCAL_PANEL"
-  PANEL_API_KEY=""
-  PANEL_AUTH_MODE="token"
-  ALLOW_LOCAL_PANEL="1"
-  if ! panel_login >/dev/null 2>&1; then
+  if [[ -n "$PANEL_USER" && -n "$PANEL_PASS" ]]; then
+    PANEL_API_KEY=""
+    PANEL_AUTH_MODE="token"
+    local saved_allow="$ALLOW_LOCAL_PANEL"
+    ALLOW_LOCAL_PANEL="1"
+    # Do NOT use $(...) here: a subshell would discard PANEL_ACCESS_TOKEN.
+    local login_log; login_log="$(mktemp)"
+    panel_login >"$login_log" 2>&1 || true
+    session_out="$(cat "$login_log" 2>/dev/null || true)"
+    rm -f -- "$login_log"
     ALLOW_LOCAL_PANEL="$saved_allow"
-    PANEL_API_KEY="$stale"
-    error "Could not get an admin session (check username/password and panel URL)."
-    warn "Tip: --panel-url must point at the real panel API root, not a proxy domain."
-    return 1
-  fi
-  ALLOW_LOCAL_PANEL="$saved_allow"
-
-  # A previously created key cannot be recovered from the list (only a trimmed
-  # value is returned), so remove stale dedicated keys before minting one.
-  if panel_api GET "/api_keys?name=${PANEL_KEY_NAME}" >/dev/null 2>&1; then
-    local ids
-    ids="$(jq -c '[.api_keys[]?.id]' <<<"$PANEL_API_BODY" 2>/dev/null || echo '[]')"
-    if [[ "$ids" != "[]" ]]; then
-      panel_api POST "/api_keys/bulk/delete" "{\"ids\":${ids}}" >/dev/null 2>&1 || true
-      info "Removed ${ids} stale dedicated key id(s)."
+    if [[ -n "$PANEL_ACCESS_TOKEN" && "$PANEL_AUTH_MODE" == "token" ]] && \
+       panel_api GET "/cores" >/dev/null 2>&1; then
+      local ids payload key
+      if panel_api GET "/api_keys?name=${PANEL_KEY_NAME}" >/dev/null 2>&1; then
+        ids="$(jq -c '[.api_keys[]?.id]' <<<"$PANEL_API_BODY" 2>/dev/null || echo '[]')"
+        if [[ "$ids" != "[]" ]]; then
+          panel_api POST "/api_keys/bulk/delete" "{\"ids\":${ids}}" >/dev/null 2>&1 || true
+        fi
+      fi
+      payload="$(jq -n --arg n "$PANEL_KEY_NAME" \
+          '{name: $n, note: "Created by WARP Manager; reused across versions", inherit_permissions: true}')"
+      if panel_api POST "/api_key" "$payload" >/dev/null 2>&1; then
+        key="$(jq -r '.api_key // empty' <<<"$PANEL_API_BODY" 2>/dev/null || true)"
+        if [[ -n "$key" ]]; then created="$key"; fi
+      fi
+    else
+      info "Official API login unavailable: ${session_out:-no panel endpoint responded}."
     fi
   fi
 
-  local payload
-  payload="$(jq -n --arg n "$PANEL_KEY_NAME" \
-      '{name: $n, note: "Created by WARP Manager; reused across all versions", inherit_permissions: true}')"
-  if ! panel_api POST "/api_key" "$payload"; then
+  if [[ -z "$created" ]]; then
+    warn "Creating the dedicated API key directly in the local panel database."
+    warn "A full backup exists; only the '${PANEL_KEY_NAME}' row in api_keys is touched."
+    created="$(create_api_key_via_db)" || created=""
+  fi
+
+  if [[ -z "$created" ]]; then
     PANEL_API_KEY="$stale"
-    error "Could not create the API key (needs api_keys:create, or an owner admin)."
-    warn "Env admins (SUDO_USERNAME) cannot create keys; use a real owner account."
+    PANEL_AUTH_MODE="token"
+    error "Could not create a dedicated API key automatically."
+    warn "Create one in Panel -> API Keys and pass: --panel-key pg_key_... ."
     return 1
   fi
-  local key
-  key="$(jq -r '.api_key // empty' <<<"$PANEL_API_BODY" 2>/dev/null || true)"
-  if [[ -z "$key" ]]; then
-    PANEL_API_KEY="$stale"
-    error "Panel did not return the raw API key."
-    return 1
-  fi
-  PANEL_API_KEY="$key"
+
+  PANEL_API_KEY="$created"
   PANEL_AUTH_MODE="api-key"
-  PANEL_ACCESS_TOKEN="$key"
-  state_set PANEL_API_KEY "$key"
+  PANEL_ACCESS_TOKEN="$created"
+  state_set PANEL_API_KEY "$created"
   state_set PANEL_KEY_NAME "$PANEL_KEY_NAME"
+  if [[ -n "$PANEL_URL" ]]; then state_set PANEL_URL "$PANEL_URL"; fi
   ok "Created dedicated API key '${PANEL_KEY_NAME}' and saved it for all future runs."
+  if ! panel_login >/dev/null 2>&1; then
+    warn "Key was created but no panel endpoint answered yet; 'apply' will retry."
+  elif [[ -n "$PANEL_URL" ]]; then
+    state_set PANEL_URL "$PANEL_URL"
+  fi
   return 0
 }
 
@@ -2009,6 +2098,7 @@ cmd_key() {
   state_init
   header "$APP_NAME v$SCRIPT_VERSION - API Key"
   load_saved_api_key
+  load_saved_panel_url
   if ensure_api_key; then
     info "Key name: ${PANEL_KEY_NAME}"
     info "Stored at: ${STATE_FILE} (0600). Shared by every version of this script."
@@ -2068,12 +2158,12 @@ cmd_apply() {
   state_init
   load_saved_api_key
   header "$APP_NAME v$SCRIPT_VERSION - Apply Panel Config (${action})"
-  if [[ "$AUTO_KEY" == "1" || ( -z "$PANEL_API_KEY" && -n "$PANEL_USER" && -n "$PANEL_PASS" ) ]]; then
-    ensure_api_key || die "Could not create/verify a dedicated API key."
-  fi
   have jq || die "jq is required for panel API integration."
+  if [[ -z "$PANEL_API_KEY" ]]; then
+    ensure_api_key || die "Could not create/verify a dedicated API key. Run 'warp-manager key'."
+  fi
   if [[ -z "$PANEL_URL" && -z "$PANEL_API_KEY" ]]; then
-    die "Provide --panel-key KEY (recommended), or --panel-url URL with admin credentials."
+    die "Provide --panel-key KEY, or run 'warp-manager key' first."
   fi
   local saved_routing
   saved_routing="$(state_get ROUTING domains)"
@@ -2375,7 +2465,9 @@ TXT
   state_set_many "INSTALLED=0" "REMOVED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PROFILES="
   ok "WARP removed."
 
-  if confirm "Also uninstall the manager command and logs? (backups are ALWAYS kept)"; then
+  if [[ "$UNINSTALL_MANAGER" != "1" && "$ASSUME_YES" == "1" ]]; then
+    info "Keeping the 'warp-manager' command (pass --uninstall-manager to remove it)."
+  elif [[ "$UNINSTALL_MANAGER" == "1" ]] || confirm "Also uninstall the manager command and logs? (backups are ALWAYS kept)"; then
     rm -f -- "$BIN_LINK"
     local x
     for x in "$APP_DIR"/* "$APP_DIR"/.[!.]*; do
@@ -2750,6 +2842,7 @@ Panel API options (optional):
   --auto-key                Create/reuse the dedicated API key automatically
   --backup-label NAME       Label for a 'backup' run
   --from DIR                Backup directory for 'restore' (or pass it directly)
+  --uninstall-manager       With 'remove': also remove the warp-manager command
   --panel-token TOKEN       Bearer token instead of username/password
   --core-id ID              Core configuration ID to modify
   --apply-panel             Force API apply
@@ -2813,6 +2906,7 @@ parse_args() {
       --backup-label) BACKUP_LABEL="$2"; shift 2 ;;
       --auto-key) AUTO_KEY=1; shift ;;
       --restore-db) RESTORE_DB=1; shift ;;
+      --uninstall-manager) UNINSTALL_MANAGER=1; shift ;;
       --from) RESTORE_PATH="$2"; shift 2 ;;
       --core-id) PANEL_CORE_ID="$2"; shift 2 ;;
       --apply-panel) APPLY_PANEL="yes"; shift ;;

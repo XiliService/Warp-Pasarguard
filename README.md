@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.8
+  PasarGuard WARP Manager  v1.0.9
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -566,3 +566,32 @@ create a new one (stale dedicated keys are removed first).
 You can skip the credentials entirely by passing an existing key:
 `--panel-key pg_key_...`. Env admins (`SUDO_USERNAME`) cannot create API keys;
 use a real owner/admin account or provide the key manually.
+
+---
+
+## Zero-credential key creation (1.0.9)
+
+`warp-manager key`, `install` and `apply` no longer need you to paste a key or
+even type an admin password when the panel database runs on the same host:
+
+1. Reuse the saved `warp-manager` key (verified with a read-only `/api/cores`).
+2. Otherwise try the official `POST /api/api_key` with admin credentials, if
+   they are supplied (the password is never stored).
+3. Otherwise insert exactly one row into `api_keys` via `docker exec psql`,
+   using the panel's own documented `key_hash` format
+   (`v1$<b64url(sha256[:16])>$sha256$<sha256hex>`), then verify the new key
+   with `GET /api/cores` before using it.
+
+The key is stored in `state.env` (0600) and reused by every later version.
+Stale dedicated keys are removed before a new one is minted. A full backup is
+recommended first: `sudo warp-manager backup`.
+
+`remove --yes` keeps the `warp-manager` command by default; pass
+`--uninstall-manager` only if you really want it gone.
+
+## After a remove + reinstall
+
+A reinstall registers a NEW WARP account, so the `warp` outbound you pasted
+earlier contains an OLD private key. Run `sudo warp-manager apply --yes` once:
+it rewrites the Core config with the current key, restores the correct
+outbound/rule order, and keeps `DIRECT` first.

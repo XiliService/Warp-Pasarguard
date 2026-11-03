@@ -56,7 +56,7 @@ check "--help documents the apply command" \
 check "--help documents the fix-compose command" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'fix-compose Re-detect'"
 apply_err="$(WARP_APP_DIR="$WORK/apply-app" bash "$ROOT/warp-manager.sh" apply --yes 2>&1 || true)"
-if printf '%s' "$apply_err" | grep -q 'Provide --panel-key KEY'; then
+if printf '%s' "$apply_err" | grep -q "Run 'warp-manager key'"; then
   t_ok "apply without a panel URL fails with a clear message"
 else
   t_fail "apply without a panel URL fails with a clear message"
@@ -605,24 +605,31 @@ mkdir -p "$WORK/fakebin5"
 cat >"$WORK/fakebin5/curl" <<'EOF'
 #!/usr/bin/env bash
 url="${@: -1}"
-out=""; prev=""; has_key=0; method=""
+out=""; prev=""; has_key=0; has_jwt=0
 for a in "$@"; do
   if [[ "$prev" == "-o" ]]; then out="$a"; fi
-  if [[ "$prev" == "-X" ]]; then method="$a"; fi
   if [[ "$a" == X-Api-Key:* ]]; then has_key=1; fi
+  if [[ "$a" == "Authorization: Bearer JWT" ]]; then has_jwt=1; fi
   prev="$a"
 done
-if [[ "$has_key" != "1" ]]; then
+if [[ "$url" == */api/admin/token ]]; then
+  printf '{"access_token":"JWT"}' >"$out"; printf '200'; exit 0
+fi
+if [[ "$has_key" != "1" && "$has_jwt" != "1" ]]; then
   printf '{"detail":"unauthorized"}' >"$out"; printf '401'; exit 0
 fi
 if [[ "$url" == */api/cores ]]; then
   printf '{"count":1,"cores":[{"id":1,"name":"foreign","type":"xray"}]}' >"$out"
   printf '200'; exit 0
 fi
-if [[ "$url" == */api/admin/token ]]; then
-  printf '{"detail":"should not be called"}' >"$out"; printf '500'; exit 0
+if [[ "$url" == */api/api_keys* ]]; then
+  printf '{"api_keys":[],"total":0}' >"$out"; printf '200'; exit 0
 fi
-printf '{"detail":"not found"}' >"$out"; printf '404'; exit 0
+if [[ "$url" == */api/api_key ]]; then
+  printf '{"id":7,"name":"warp-manager","api_key":"pg_key_created_by_script"}' >"$out"
+  printf '201'; exit 0
+fi
+printf '{}' >"$out"; printf '200'; exit 0
 EOF
 chmod +x "$WORK/fakebin5/curl"
 cat >"$WORK/fakebin5/docker" <<'EOF'
@@ -775,6 +782,8 @@ WARP_APP_DIR="$WORK/rm-app" PATH="$WORK/fakebin7:$WORK/bin:$PATH" \
   bash "$ROOT/warp-manager.sh" remove --yes >/dev/null 2>&1 || true
 check "remove always keeps the pre-remove backup" \
   bash -c 'ls -d "$1"/backups/full-*pre-remove >/dev/null 2>&1' _ "$WORK/rm-app"
+check "remove --yes keeps the manager command (no accidental uninstall)" \
+  test -f "$WORK/rm-app/warp-manager.sh"
 check "remove keeps the manager script so restore is possible" \
   test -f "$WORK/rm-app/warp-manager.sh"
 rm_bk="$(ls -d "$WORK"/rm-app/backups/full-*pre-remove 2>/dev/null | head -1)"
@@ -791,6 +800,38 @@ key_reuse="$(WARP_APP_DIR="$WORK/key-life-app" WARP_MANAGER="$ROOT/warp-manager.
     printf "%s" "$PANEL_API_KEY"' 2>/dev/null || true)"
 assert_eq "second run reuses the same key across versions" \
   "pg_key_created_by_script" "$key_reuse"
+
+# ---------------------------------------------------------------------------
+printf '\n[8i] Zero-credential key creation via the panel database\n'
+mkdir -p "$WORK/fakebin8"
+cat >"$WORK/fakebin8/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) printf 'pasarguard-timescaledb-1 timescale/timescaledb:latest\n'; exit 0 ;;
+  inspect) printf '["POSTGRES_USER=pguser","POSTGRES_PASSWORD=pgpass","POSTGRES_DB=pgdb"]\n'; exit 0 ;;
+  exec)
+    if printf '%s\n' "$@" | grep -q -- '-tAc'; then printf '1\n'; else :; fi
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin8/docker"
+dbkey="$(WARP_APP_DIR="$WORK/dbkey-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin8:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    create_api_key_via_db' 2>/dev/null || true)"
+check "create_api_key_via_db mints a pg_key_ UUID without any credentials" \
+  bash -c '[[ "$1" =~ ^pg_key_[0-9a-f-]{36}$ ]]' _ "$dbkey"
+key_lifecycle="$(WARP_APP_DIR="$WORK/dbkey-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin8:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    ASSUME_YES=1
+    ensure_api_key >/dev/null 2>&1 || true
+    printf "%s|%s" "$PANEL_API_KEY" "$(state_get PANEL_API_KEY "")"' 2>/dev/null || true)"
+check "ensure_api_key persists the DB-created key to state.env" \
+  bash -c '[[ "$1" == pg_key_*"|"pg_key_* ]]' _ "$key_lifecycle"
+check "remove --yes keeps the warp-manager command" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--uninstall-manager'"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'

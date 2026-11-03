@@ -206,3 +206,28 @@ Every `install` and `remove` writes a full backup under
 `warp-manager restore <dir>` for files and follow `RESTORE.md` for the
 PostgreSQL/SQLite dump. Core Settings are also saved individually as
 `panel-core-<id>-*.json` before every API apply.
+
+---
+
+## `warp-manager key` / `apply` says it cannot create a key
+
+* Make sure a PostgreSQL container (`timescale`/`postgres`) is running and the
+  script runs as root/sudo - the automatic fallback writes one row via
+  `docker exec ... psql`.
+* Take a backup first: `sudo warp-manager backup`.
+* If you prefer the official route, pass `--panel-user USER --panel-pass PASS`
+  once; the resulting key is then reused forever.
+* Fallback of last resort: create a key in Panel -> API Keys and pass
+  `--panel-key pg_key_...`.
+
+## `warp-manager: command not found` after `remove`
+
+Older versions removed the command on `remove --yes`. From 1.0.9 it is kept
+unless `--uninstall-manager` is passed. If it is already gone, reinstall the
+bootstrap (the backup directory and `warp-manager.sh` are always preserved):
+
+```bash
+curl -fsSL -H 'Accept: application/vnd.github.raw' \
+  'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' \
+  | sudo bash -s -- --branch arena/01417195-warp-pasarguard --no-menu
+```
