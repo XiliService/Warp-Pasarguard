@@ -136,11 +136,20 @@ curl -fsSL "https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/arena/
 sudo ./install.sh --local ./warp-manager.sh --no-menu
 ```
 
-Append `?v=<anything>` to the URL after a push: `raw.githubusercontent.com`
-is CDN-cached for a few minutes, and the query string forces a fresh copy.
-The installer itself also adds a cache-buster when downloading
-`warp-manager.sh`. `install.sh` works both from a file and when streamed with
-`curl | bash -s` (where `BASH_SOURCE[0]` is unset).
+`raw.githubusercontent.com` is CDN-cached for a few minutes after a push. For
+a guaranteed-fresh copy use the GitHub API raw endpoint instead (no auth
+needed for a public repo):
+
+```bash
+curl -fsSL -H 'Accept: application/vnd.github.raw' \
+  'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' \
+  | sudo bash -s -- --branch arena/01417195-warp-pasarguard
+```
+
+The installer itself tries `api.github.com` first (never CDN-cached), then the
+raw CDN mirrors, and adds a cache-buster to every URL. `install.sh` works both
+from a file and when streamed with `curl | bash -s` (where `BASH_SOURCE[0]` is
+unset).
 
 ---
 

@@ -253,7 +253,9 @@ version_ge() {
 
 fetch() {
   local url="$1" out="$2"
-  local -a opts=(-fsSL --retry 3 --retry-delay 2 --connect-timeout 12 --max-time 90)
+  local -a opts=(-fsSL --retry 3 --retry-delay 2 --connect-timeout 12 --max-time 90 \
+                 -H 'User-Agent: Warp-Pasarguard' \
+                 -H 'Accept: application/vnd.github.raw')
   [[ "$INSECURE" == "1" ]] && opts+=(-k)
   curl "${opts[@]}" -o "$out" "$url"
 }
@@ -1615,6 +1617,7 @@ cmd_update() {
     local cache_bust
     cache_bust="$(date +%s)"
     for b in "${branches[@]}"; do
+      urls+=("https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/warp-manager.sh?ref=${b}&v=${cache_bust}")
       urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh?v=${cache_bust}")
       urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh?v=${cache_bust}")
     done

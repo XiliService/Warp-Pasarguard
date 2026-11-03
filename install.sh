@@ -89,11 +89,14 @@ done
 download() {
   local url="$1" out="$2"
   if [[ "$HAVE_TOOL" == "curl" ]]; then
-    local -a opts=(-fsSL --retry 2 --connect-timeout 12 --max-time 60)
+    local -a opts=(-fsSL --retry 2 --connect-timeout 12 --max-time 60 \
+                   -H 'User-Agent: Warp-Pasarguard' \
+                   -H 'Accept: application/vnd.github.raw')
     [[ "$INSECURE" == "1" ]] && opts+=(-k)
     curl "${opts[@]}" -o "$out" "$url"
   else
-    local -a opts=(-q)
+    local -a opts=(-q --header='User-Agent: Warp-Pasarguard' \
+                       --header='Accept: application/vnd.github.raw')
     [[ "$INSECURE" == "1" ]] && opts+=(--no-check-certificate)
     wget "${opts[@]}" -O "$out" "$url"
   fi
@@ -131,6 +134,9 @@ else
       [[ "$BRANCH" != "$BRANCH_FALLBACK" ]] && branches+=("$BRANCH_FALLBACK")
       cache_bust="$(date +%s)"
       for b in "${branches[@]}"; do
+        # api.github.com is not CDN-cached, so a just-pushed fix is visible
+        # immediately. raw CDN mirrors stay as fallbacks.
+        urls+=("https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}/contents/warp-manager.sh?ref=${b}&v=${cache_bust}")
         urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh?v=${cache_bust}")
         urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh?v=${cache_bust}")
       done
