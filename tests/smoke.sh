@@ -1198,6 +1198,25 @@ check "warp-link leaves the location rules untouched" \
   bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"Out-DE\")] | length == 2' '$link_put' >/dev/null"
 check "warp-link WARP outbound is userspace" \
   bash -c "jq -e '.config.outbounds[] | select(.tag==\"warp\") | .settings.noKernelTun == true' '$link_put' >/dev/null"
+check "--core-id override is honoured by the link commands" \
+  bash -c "WARP_APP_DIR='$WORK/cid-app' PANEL_CORE_ID=7 WARP_MANAGER='$ROOT/warp-manager.sh' bash -c 'source \"\$WARP_MANAGER\" >/dev/null 2>&1 || true; PANEL_CORE_ID=7; resolve_link_core 1' | grep -qx 7"
+cat >"$WORK/mismatch-core.sh" <<'EOS'
+WARP_APP_DIR="$WORK/cid2-app"
+source "$ROOT/warp-manager.sh" >/dev/null 2>&1 || true
+panel_login() { return 0; }
+panel_api() {
+  if [[ "$1" == GET && "$2" == /cores ]]; then
+    PANEL_API_BODY='{"cores":[{"id":1}]}'
+  else
+    PANEL_API_BODY='{"config":{"inbounds":[{"tag":"Germany"}]}}'
+  fi
+  return 0
+}
+panel_authed_core 1 >/dev/null 2>&1
+[[ $? -ne 0 ]]
+EOS
+check "core auto-selection refuses to guess on a mismatched relay" \
+  bash "$WORK/mismatch-core.sh"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'

@@ -2721,9 +2721,24 @@ panel_authed_core() {
       best="$cid"; break
     fi
   done
-  [[ -n "$best" ]] || best="${ids[0]}"
+  if [[ -z "$best" ]]; then
+    if [[ "$want_tunnel" == "1" ]]; then
+      error "No Core config with tunnel inbounds was found. Set --core-id to the Iran main Core."
+    else
+      error "No Core config without tunnel inbounds was found. Set --core-id to the foreign relay Core."
+    fi
+    return 1
+  fi
   printf '%s' "$best"
   return 0
+}
+
+resolve_link_core() {
+  local want="$1"
+  if [[ -n "${PANEL_CORE_ID:-}" ]]; then
+    printf '%s' "$PANEL_CORE_ID"; return 0
+  fi
+  panel_authed_core "$want"
 }
 
 cmd_warp_link() {
@@ -2737,7 +2752,7 @@ cmd_warp_link() {
   build_snippets "${profiles[@]}" >/dev/null || die "Could not build the WARP outbound."
   header "$APP_NAME v$SCRIPT_VERSION - Create dedicated WARP link (FOREIGN server)"
   [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
-  local core_id; core_id="$(panel_authed_core 0)" || die "Panel API is unreachable."
+  local core_id; core_id="$(resolve_link_core 0)" || die "Could not choose the foreign relay Core config."
   info "Using Core config ${core_id} on this egress relay."
   panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
   local snapshot="$BACKUP_DIR/warp-link-core-${core_id}-$(now_tag).json"
@@ -2833,7 +2848,7 @@ cmd_warp_join() {
   fi
   ok "WARP link ${lh}:${lp} is reachable from this server."
   [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
-  local core_id; core_id="$(panel_authed_core 1)" || die "Panel API is unreachable."
+  local core_id; core_id="$(resolve_link_core 1)" || die "Could not choose the Iran main Core config."
   info "Using Core config ${core_id} (it has the tunnel inbounds)."
   panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
   local snapshot="$BACKUP_DIR/warp-join-core-${core_id}-$(now_tag).json"
