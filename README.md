@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.10
+  PasarGuard WARP Manager  v1.0.11
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -569,7 +569,7 @@ use a real owner/admin account or provide the key manually.
 
 ---
 
-## Zero-credential key creation (1.0.10)
+## Zero-credential key creation (1.0.11)
 
 `warp-manager key`, `install` and `apply` no longer need you to paste a key or
 even type an admin password when the panel database runs on the same host:
@@ -598,7 +598,7 @@ outbound/rule order, and keeps `DIRECT` first.
 
 ---
 
-## Panel discovery when no host port is published (1.0.10)
+## Panel discovery when no host port is published (1.0.11)
 
 Some PasarGuard deployments run the panel API inside a Docker network with no
 published port, so `127.0.0.1:8000` and the domain both fail. `apply` now:
@@ -615,3 +615,33 @@ probes still fail, `apply` prints every URL it tried plus `docker ps` output so
 the remaining problem is visible in the log.
 
 Overrides: `WARP_PANEL_CONTAINER=NAME` and `WARP_PANEL_TRANSPORT=nsenter`.
+
+---
+
+## Reaching the panel API from inside its container (1.0.11)
+
+PasarGuard has three official binding modes (`config.py` / `main.py`):
+
+| Env | Listener | Why host probes fail |
+| --- | --- | --- |
+| `UVICORN_UDS` | Unix socket (no TCP at all) | Nothing listens on any port |
+| `UVICORN_SSL_CERTFILE` + `KEYFILE` | HTTPS on `0.0.0.0:UVICORN_PORT` | Plain HTTP probes get no reply |
+| neither | HTTP on `127.0.0.1:UVICORN_PORT` only | Bridge IP and host loopback cannot reach it |
+
+`apply` now tries, in order:
+
+1. Configured / saved URL, Docker-published ports, container bridge IPs, and
+   common local ports.
+2. Public domains from `VITE_BASE_API` / `PASSKEY_ORIGIN` / `ALLOWED_ORIGINS`,
+   the host FQDN/IP, and `server_name` entries in nginx/Caddy configs.
+3. **curl executed inside the panel container** (`docker exec`), using
+   `UVICORN_UDS`, HTTPS on the TLS port, or HTTP on loopback. The official
+   panel image ships curl for its own healthcheck, so this works even with a
+   Unix socket. The chosen transport is saved to `state.env` and reused.
+4. `nsenter` into the container's network namespace as a final fallback.
+
+Failures now log every URL tried, the panel container's `UVICORN_*` values,
+and the first HTTP reply received (not just the last network error).
+
+Overrides: `WARP_PANEL_EXEC_UDS`, `WARP_PANEL_EXEC_SCHEME`,
+`WARP_PANEL_EXEC_HOST`, `WARP_PANEL_EXEC_PORT`.

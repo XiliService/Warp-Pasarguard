@@ -894,6 +894,67 @@ check "panel_nsenter_probe persists container and transport for later runs" \
   bash -c '[[ "$1" == "nsenter|pasarguard-pasarguard-1|nsenter" ]]' _ "$ns_state"
 
 # ---------------------------------------------------------------------------
+printf '\n[8k] Panel curl-inside-container (UDS / loopback-only) transport\n'
+mkdir -p "$WORK/fakebin10"
+cat >"$WORK/fakebin10/docker" <<EOF
+#!/usr/bin/env bash
+BOX="$WORK/exec-body"
+case "\${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1 pasarguard/panel:latest\n'; exit 0 ;;
+  inspect)
+    case "\$4" in
+      *Config.Env*) printf 'VITE_BASE_API=https://panel.example.com/\nUVICORN_UDS=/run/pasarguard.socket\nUVICORN_PORT=8000\n' ;;
+      *) printf '\n' ;; esac; exit 0 ;;
+  exec)
+    shift; [[ "\${1:-}" == "-i" ]] && shift; cname="\$1"; shift
+    if [[ "\${1:-}" == "rm" ]]; then rm -f "\$BOX"; exit 0; fi
+    if [[ "\${1:-}" == "sh" ]]; then exit 0; fi
+    if [[ "\${1:-}" == "curl" ]]; then
+      shift
+      while [[ \$# -gt 0 ]]; do
+        if [[ "\$1" == "-o" ]]; then printf '{"cores":[]}' > "\$BOX"; shift 2
+        elif [[ "\$1" == --unix-socket ]]; then shift 2
+        elif [[ "\$1" == http://* ]]; then shift
+        else shift; fi
+      done
+      printf '200'; exit 0
+    fi
+    exit 0 ;;
+  cp) cp -f "\$BOX" "\$3" 2>/dev/null; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin10/docker"
+public="$(WARP_APP_DIR="$WORK/pub-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin10:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    panel_public_urls' 2>/dev/null || true)"
+check "panel_public_urls discovers VITE_BASE_API from the panel container" \
+  bash -c '[[ "$1" == *"https://panel.example.com"* ]]' _ "$public"
+check "panel_public_urls also emits the host FQDN" \
+  bash -c '[[ "$1" == *"https://"* ]]' _ "$public"
+exec_result="$(WARP_APP_DIR="$WORK/exec-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin10:$PATH" bash -c '
+    source "$WARP_MANAGER"; state_init
+    PANEL_TRANSPORT="docker-exec"; PANEL_CONTAINER="pasarguard-pasarguard-1"
+    PANEL_EXEC_UDS="/run/pasarguard.socket"; PANEL_EXEC_SCHEME="http"
+    PANEL_EXEC_HOST="127.0.0.1"; PANEL_EXEC_PORT="8000"
+    out="$(mktemp)"
+    code="$(curl_panel -sS -X GET -o "$out" -w "%{http_code}" http://127.0.0.1:8000/api/cores)"
+    printf "%s|%s" "$code" "$(cat "$out")"' 2>/dev/null || true)"
+check "curl_panel docker-exec returns the HTTP code and writes the body" \
+  bash -c '[[ "$1" == "200|{\"cores\":[]}" ]]' _ "$exec_result"
+exec_state="$(WARP_APP_DIR="$WORK/exec-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin10:$PATH" bash -c '
+    source "$WARP_MANAGER"; state_init
+    PANEL_API_KEY="pg_key_test"
+    panel_probe_key() { return 0; }
+    panel_exec_probe key >/dev/null 2>&1
+    printf "%s|%s|%s" "$(state_get PANEL_TRANSPORT "")" "$(state_get PANEL_CONTAINER "")" "$(state_get PANEL_EXEC_UDS "")"' 2>/dev/null || true)"
+check "panel_exec_probe persists the UDS transport for later runs" \
+  bash -c '[[ "$1" == "docker-exec|pasarguard-pasarguard-1|/run/pasarguard.socket" ]]' _ "$exec_state"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \

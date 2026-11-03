@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.10"
+readonly SCRIPT_VERSION="1.0.11"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -106,6 +106,7 @@ PRIMARY_IP=""; DEFAULT_ROUTE=""; DEFAULT_GW=""; DEFAULT_DEV=""
 XRAY_VERSION="unknown"; COMPOSE_SERVICES=""
 COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""; PANEL_APPLY_OK=0
 PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
+PANEL_BEST_HTTP=""; PANEL_BEST_BODY=""; PANEL_BEST_URL=""
 ALLOW_LOCAL_PANEL="0"
 ROUTE_GUARD=0
 ROUTE_BEFORE=""
@@ -118,6 +119,13 @@ PANEL_CONTAINER="${WARP_PANEL_CONTAINER:-}"
 PANEL_TRANSPORT="${WARP_PANEL_TRANSPORT:-direct}"
 PANEL_NS_PID=""
 PANEL_NS_UNIX=""
+# docker-exec transport: all panel HTTP calls are made by curl INSIDE the panel
+# container (works with UVICORN_UDS and with uvicorn bound to 127.0.0.1).
+PANEL_EXEC_UDS="${WARP_PANEL_EXEC_UDS:-}"
+PANEL_EXEC_SCHEME="${WARP_PANEL_EXEC_SCHEME:-http}"
+PANEL_EXEC_HOST="${WARP_PANEL_EXEC_HOST:-127.0.0.1}"
+PANEL_EXEC_PORT="${WARP_PANEL_EXEC_PORT:-8000}"
+PANEL_EXEC_TMP="/tmp/.warp-manager-panel-body"
 RULE_PREPEND=0  # default ROUTING=domains; never make WARP the default outbound
 
 # -----------------------------------------------------------------------------
@@ -1204,6 +1212,12 @@ load_saved_panel_url() {
   if [[ -n "$t" ]]; then PANEL_TRANSPORT="$t"; fi
   x="$(state_get PANEL_NS_UNIX '')"
   if [[ -n "$x" ]]; then PANEL_NS_UNIX="$x"; fi
+  if [[ "$PANEL_TRANSPORT" == "docker-exec" ]]; then
+    PANEL_EXEC_UDS="$(state_get PANEL_EXEC_UDS '')"
+    PANEL_EXEC_SCHEME="$(state_get PANEL_EXEC_SCHEME http)"
+    PANEL_EXEC_HOST="$(state_get PANEL_EXEC_HOST 127.0.0.1)"
+    PANEL_EXEC_PORT="$(state_get PANEL_EXEC_PORT 8000)"
+  fi
   return 0
 }
 
@@ -1228,6 +1242,11 @@ panel_probe_key() {
   body="$(cat "$tmp")"; rm -f -- "$tmp"
   PANEL_HTTP="$code"
   PANEL_BODY="$(printf '%s' "$body" | head -c 240)"
+  if [[ "$code" =~ ^[0-9]+$ && -z "$PANEL_BEST_HTTP" ]]; then
+    PANEL_BEST_HTTP="$code"
+    PANEL_BEST_BODY="$PANEL_BODY"
+    PANEL_BEST_URL="$base"
+  fi
   if [[ ! "$code" =~ ^2 ]]; then return 1; fi
   if ! jq -e '(.cores | type) == "array"' <<<"$body" >/dev/null 2>&1; then
     PANEL_HTTP="invalid-shape"
@@ -1247,9 +1266,12 @@ local_panel_urls() {
     [[ -n "$line" ]] || continue
     name="${line%% *}"; image="${line#* }"
     [[ -n "$name" ]] || continue
-    case "$image" in *timescale*|*postgres*|*redis*|*node*) continue ;; esac
-    [[ "$image" == *pasarguard* || "$name" == *pasarguard* || "$name" == *panel* ]] || continue
-
+    case "${name} ${image}" in
+      *pgbouncer*|*pgadmin*|*timescale*|*postgres*|*redis*|*node*) continue ;;
+    esac
+    if [[ "$image" != *pasarguard/panel* && "$name" != *panel* ]]; then
+      [[ "$name" == *pasarguard* ]] || continue
+    fi
     env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
     uvicorn_port="$(grep '^UVICORN_PORT=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
     if [[ ! "$uvicorn_port" =~ ^[0-9]+$ ]]; then uvicorn_port="8000"; fi
@@ -1281,6 +1303,47 @@ local_panel_urls() {
 
 # Common local ports used by a panel container (host networking or an
 # unpublished bridge port). Only tried when --allow-local-panel is given.
+# Public/reverse-proxy URLs. A host-level nginx/Caddy usually matches on the
+# Host header (SNI), so https://127.0.0.1:443 returns 404 while the real domain
+# works. Gather domains from the panel container env and the host itself.
+panel_public_urls() {
+  local name env origin host ip
+  have docker || return 0
+  while IFS= read -r name; do
+    env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+    [[ -n "$env" ]] || continue
+    while IFS= read -r origin; do
+      origin="${origin%/}"
+      [[ "$origin" == http://* || "$origin" == https://* ]] || continue
+      printf '%s\n' "$origin"
+    done < <(printf '%s\n' "$env" \
+             | grep -E '^(VITE_BASE_API|PASSKEY_ORIGIN|ALLOWED_ORIGINS|SUBSCRIPTION_BASE_URL)=' \
+             | grep -oE 'https?://[^ ,;"'\''/]+' | sort -u || true)
+  done < <(panel_container_names)
+  host="$(hostname -f 2>/dev/null || true)"
+  if [[ -n "$host" && "$host" == *.* ]]; then
+    printf 'https://%s\nhttp://%s\n' "$host" "$host"
+  fi
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    printf 'https://%s\nhttp://%s\n' "$ip" "$ip"
+  fi
+  # A host-level reverse proxy often serves the panel on a domain that is not
+  # in the container env. Read server_name from the usual proxy config trees.
+  local domain
+  if have grep; then
+    while IFS= read -r domain; do
+      [[ "$domain" == *.* && "$domain" != *'*'* ]] || continue
+      case "$domain" in localhost*|127.0.0.*|_) continue ;; esac
+      printf 'https://%s\nhttp://%s\n' "$domain" "$domain"
+    done < <(grep -rhoE 'server_name[[:space:]]+[^;]+' \
+             /etc/nginx /etc/caddy /etc/traefik 2>/dev/null \
+             | sed -E 's/^server_name[[:space:]]+//' | tr ' ' '\n' \
+             | sed 's/;$//' | grep -v '^$' | sort -u || true)
+  fi
+  return 0
+}
+
 local_port_probes() {
   local p
   local -a ports=(8000 8080 80 443 8443 2053 2096 9000 3000)
@@ -1300,15 +1363,19 @@ local_port_probes() {
 # List containers that could be running the PasarGuard panel API.
 panel_container_names() {
   have docker || return 0
-  local line name image
+  local line name image env
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     name="${line%% *}"; image="${line#* }"
     [[ -n "$name" ]] || continue
-    case "$image" in *timescale*|*postgres*|*redis*|*node*) continue ;; esac
-    if [[ "$image" == *pasarguard* || "$name" == *pasarguard* || "$name" == *panel* ]]; then
-      printf '%s\n' "$name"
+    case "${name} ${image}" in
+      *pgbouncer*|*pgadmin*|*timescale*|*postgres*|*redis*|*node*) continue ;;
+    esac
+    if [[ "$image" != *pasarguard/panel* && "$name" != *panel* ]]; then
+      env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+      [[ "$name" == *pasarguard* ]] || continue
     fi
+    printf '%s\n' "$name"
   done < <(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
   return 0
 }
@@ -1316,7 +1383,55 @@ panel_container_names() {
 # curl wrapper used ONLY for panel API calls. When PANEL_TRANSPORT=nsenter the
 # request runs in the panel container's network namespace, so 127.0.0.1 is the
 # container's own loopback (works even with no published port / UDS proxy).
+# Rebuild a host URL as a container-local URL for the docker-exec transport.
+panel_exec_url() {
+  local url="$1" path
+  path="$(printf '%s' "$url" | sed -E 's#^[a-zA-Z]+://[^/]+##')"
+  [[ -z "$path" ]] && path="/"
+  [[ "$path" == /* ]] || path="/${path}"
+  if [[ -n "$PANEL_EXEC_UDS" ]]; then
+    printf 'http://localhost%s' "$path"
+  else
+    printf '%s://%s:%s%s' "$PANEL_EXEC_SCHEME" "$PANEL_EXEC_HOST" "$PANEL_EXEC_PORT" "$path"
+  fi
+}
+
+# Emulate the curl interface used by panel_probe_key / panel_try_login /
+# panel_api, but run curl inside the panel container. The body is written to a
+# temp file in the container, copied back to the host -o target, and the HTTP
+# status code is printed on stdout exactly like curl -w '%{http_code}'.
+curl_panel_exec() {
+  local -a args=()
+  local out="" err code
+  err="$(mktemp)"
+  if [[ -n "$PANEL_EXEC_UDS" ]]; then args+=(--unix-socket "$PANEL_EXEC_UDS"); fi
+  while (( $# > 0 )); do
+    case "$1" in
+      -o) out="$2"; args+=(-o "$PANEL_EXEC_TMP"); shift 2 ;;
+      http://*|https://*) args+=("$(panel_exec_url "$1")"); shift ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  code="$(docker exec -i "$PANEL_CONTAINER" curl "${args[@]}" 2>"$err")" || {
+    cat "$err" >&2; rm -f -- "$err"; return 1
+  }
+  rm -f -- "$err"
+  if [[ -n "$out" ]]; then
+    if ! docker cp "$PANEL_CONTAINER:$PANEL_EXEC_TMP" "$out" >/dev/null 2>&1; then
+      printf 'docker cp of the panel response failed' >&2
+      return 1
+    fi
+  fi
+  docker exec "$PANEL_CONTAINER" rm -f -- "$PANEL_EXEC_TMP" >/dev/null 2>&1 || true
+  printf '%s' "$code"
+  return 0
+}
+
 curl_panel() {
+  if [[ "$PANEL_TRANSPORT" == "docker-exec" ]]; then
+    curl_panel_exec "$@"
+    return $?
+  fi
   local -a pre=() extra=()
   if [[ "$PANEL_TRANSPORT" == "nsenter" ]]; then
     local pid="${PANEL_NS_PID:-}"
@@ -1342,6 +1457,82 @@ curl_panel() {
 
 # Try to reach the panel API from inside each candidate container's netns.
 # Used as a last resort after every host-level URL has failed.
+# Last-resort discovery: ask curl INSIDE the panel container. This bypasses
+# host networking entirely and supports UVICORN_UDS (the panel image ships curl
+# for its own healthcheck). Official binding modes:
+#   UVICORN_UDS                -> unix socket, no TCP listener at all
+#   SSL cert + key             -> HTTPS on 0.0.0.0:UVICORN_PORT
+#   neither                    -> HTTP on 127.0.0.1:UVICORN_PORT only
+panel_exec_probe() {
+  local mode="${1:-key}"
+  have docker || return 1
+  if [[ "$mode" == "key" && -z "$PANEL_API_KEY" ]]; then return 1; fi
+  local name env uds port cert key host tport k target scheme base
+  local saved_transport="$PANEL_TRANSPORT" saved_container="$PANEL_CONTAINER"
+  local saved_uds="$PANEL_EXEC_UDS" saved_scheme="$PANEL_EXEC_SCHEME"
+  local saved_host="$PANEL_EXEC_HOST" saved_port="$PANEL_EXEC_PORT"
+  local -a names=() targets=()
+  while IFS= read -r name; do names+=("$name"); done < <(panel_container_names)
+  if (( ${#names[@]} == 0 )); then return 1; fi
+  info "Trying curl inside ${#names[@]} candidate container(s)."
+  for name in "${names[@]}"; do
+    env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+    info "  ${name}: $(grep -E '^UVICORN_(PORT|UDS|HOST|SSL_CERTFILE|SSL_KEYFILE)=' <<<"$env" | tr '\n' ' ')"
+    if ! docker exec "$name" sh -c 'command -v curl >/dev/null 2>&1' >/dev/null 2>&1; then
+      continue
+    fi
+    uds="$(grep '^UVICORN_UDS=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    port="$(grep '^UVICORN_PORT=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    cert="$(grep '^UVICORN_SSL_CERTFILE=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    key="$(grep '^UVICORN_SSL_KEYFILE=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    host="$(grep '^UVICORN_HOST=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    [[ "$port" =~ ^[0-9]+$ ]] || port="8000"
+    if [[ -z "$host" || "$host" == "0.0.0.0" ]]; then host="127.0.0.1"; fi
+
+    targets=()
+    if [[ -n "$uds" ]]; then targets+=("uds|${uds}|${port}"); fi
+    if [[ -n "$cert" && -n "$key" ]]; then targets+=("https|${port}|${port}"); fi
+    targets+=("http|${port}|${port}")
+    for p in 8000 8080 3000 9000 80 443; do targets+=("http|${p}|${p}"); done
+
+    for target in "${targets[@]}"; do
+      IFS='|' read -r scheme tport port <<<"$target"
+      PANEL_TRANSPORT="docker-exec"
+      PANEL_CONTAINER="$name"
+      PANEL_EXEC_HOST="$host"
+      PANEL_EXEC_PORT="$port"
+      PANEL_EXEC_SCHEME="$scheme"
+      if [[ "$scheme" == "uds" ]]; then
+        PANEL_EXEC_UDS="$tport"; PANEL_EXEC_SCHEME="http"
+      else
+        PANEL_EXEC_UDS=""
+      fi
+      k=0; [[ "$scheme" == "https" ]] && k=1
+      base="http://127.0.0.1:${port}"
+      if [[ "$mode" == "token" ]]; then
+        panel_try_login "$base" "$k" || continue
+      else
+        panel_probe_key "$base" "$k" || continue
+      fi
+      PANEL_URL="$base"
+      INSECURE="$k"
+      state_set PANEL_URL "$base"
+      state_set PANEL_CONTAINER "$name"
+      state_set PANEL_TRANSPORT docker-exec
+      state_set PANEL_EXEC_UDS "$PANEL_EXEC_UDS"
+      state_set PANEL_EXEC_SCHEME "$PANEL_EXEC_SCHEME"
+      state_set PANEL_EXEC_HOST "$PANEL_EXEC_HOST"
+      state_set PANEL_EXEC_PORT "$PANEL_EXEC_PORT"
+      ok "Panel API reachable via curl inside container ${name}."
+      return 0
+    done
+  done
+  PANEL_TRANSPORT="$saved_transport"; PANEL_CONTAINER="$saved_container"
+  PANEL_EXEC_UDS="$saved_uds"; PANEL_EXEC_SCHEME="$saved_scheme"
+  PANEL_EXEC_HOST="$saved_host"; PANEL_EXEC_PORT="$saved_port"
+  return 1
+}
+
 panel_nsenter_probe() {
   local mode="${1:-key}"
   have docker || return 1
@@ -1441,6 +1632,10 @@ panel_login() {
       [[ -n "$b" ]] || continue
       [[ " ${urls[*]:-} " == *" ${b} "* ]] || urls+=("$b")
     done < <(local_port_probes)
+    while IFS= read -r b; do
+      [[ -n "$b" ]] || continue
+      [[ " ${urls[*]:-} " == *" ${b} "* ]] || urls+=("$b")
+    done < <(panel_public_urls)
     if (( ${#urls[@]} == 0 )); then
       error "No panel URL configured and no local panel found."
       return 1
@@ -1456,6 +1651,7 @@ panel_login() {
         probes+=("${url}|0")
       fi
     done
+    PANEL_BEST_HTTP=""; PANEL_BEST_BODY=""; PANEL_BEST_URL=""
     info "Checking ${#probes[@]} candidate panel endpoint(s) with the API key."
     for probe in "${probes[@]}"; do
       url="${probe%|*}"; k="${probe##*|}"
@@ -1465,10 +1661,14 @@ panel_login() {
         return 0
       fi
     done
+    if panel_exec_probe key; then return 0; fi
     if panel_nsenter_probe key; then return 0; fi
     error "The API key did not work on any panel endpoint."
     if [[ -n "$PANEL_NETERR" ]]; then error "  Last network error: ${PANEL_NETERR}"; fi
     error "  Last response (HTTP ${PANEL_HTTP}): ${PANEL_BODY}"
+    if [[ -n "$PANEL_BEST_HTTP" ]]; then
+      error "  First HTTP reply: ${PANEL_BEST_HTTP} at ${PANEL_BEST_URL}: ${PANEL_BEST_BODY}"
+    fi
     local tried
     for tried in "${urls[@]}"; do info "  Tried: ${tried}"; done
     if have docker; then
@@ -1503,6 +1703,10 @@ panel_login() {
     [[ -n "$b" ]] || continue
     [[ " ${urls[*]} " == *" ${b} "* ]] || urls+=("$b")
   done < <(local_panel_urls)
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    [[ " ${urls[*]} " == *" ${b} "* ]] || urls+=("$b")
+  done < <(panel_public_urls)
   if [[ "$ALLOW_LOCAL_PANEL" == "1" ]]; then
     while IFS= read -r b; do
       [[ -n "$b" ]] || continue
@@ -1542,6 +1746,7 @@ panel_login() {
     done
   done
 
+  if panel_exec_probe token; then return 0; fi
   if panel_nsenter_probe token; then return 0; fi
   error "Panel login failed."
   error "  ${configured} -> ${configured_err:-unknown error}"
@@ -3026,7 +3231,8 @@ Other options:
 
 Environment variables:
   WARP_APP_DIR, WARP_BRANCH, WARP_UPDATE_URL, WARP_MODE, WARP_TARGET,
-  WARP_PANEL_CONTAINER, WARP_PANEL_TRANSPORT (use nsenter for an unpublished panel),
+  WARP_PANEL_CONTAINER, WARP_PANEL_TRANSPORT (docker-exec / nsenter / direct),
+  WARP_PANEL_EXEC_UDS, WARP_PANEL_EXEC_SCHEME, WARP_PANEL_EXEC_PORT,
   WARP_BINDING, WARP_SRC_IP, WARP_LABEL, WARP_LABELS, WARP_ENDPOINT, WARP_ROUTING,
   WARP_DOMAINS, WARP_LICENSE_KEY, WARP_APPLY_PANEL, WGCF_VERSION,
   WARP_YES, WARP_DRY_RUN, WARP_FORCE, WARP_INSECURE, WARP_DEBUG,
