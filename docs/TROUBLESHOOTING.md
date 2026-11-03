@@ -222,7 +222,7 @@ PostgreSQL/SQLite dump. Core Settings are also saved individually as
 
 ## `warp-manager: command not found` after `remove`
 
-Older versions removed the command on `remove --yes`. From 1.0.11 it is kept
+Older versions removed the command on `remove --yes`. From 1.0.12 it is kept
 unless `--uninstall-manager` is passed. If it is already gone, reinstall the
 bootstrap (the backup directory and `warp-manager.sh` are always preserved):
 
@@ -237,7 +237,7 @@ curl -fsSL -H 'Accept: application/vnd.github.raw' \
 ## `Created dedicated API key` but `no panel endpoint answered`
 
 The key was written to the panel database successfully; only the HTTP endpoint
-was unreachable. From 1.0.11 the script probes Docker bridge IPs and uses
+was unreachable. From 1.0.12 the script probes Docker bridge IPs and uses
 `nsenter` to reach the panel from inside its own container. Re-run:
 
 ```bash
@@ -252,7 +252,7 @@ containers. Make sure the `pasarguard/panel` container is actually running.
 
 ## All panel endpoints fail (33/36 candidates), key was created in the DB
 
-Do not remove or reinstall. From 1.0.11 the script runs curl **inside** the
+Do not remove or reinstall. From 1.0.12 the script runs curl **inside** the
 `pasarguard/panel` container, which supports `UVICORN_UDS`, TLS, and
 loopback-only listeners. Re-run:
 
@@ -264,3 +264,26 @@ sudo warp-manager apply --yes
 The log prints the container's `UVICORN_*` settings and the first HTTP reply.
 Container discovery deliberately ignores `pgbouncer`, `pgadmin`,
 `timescaledb`, and node containers (they caused timeout noise in earlier logs).
+
+---
+
+## All configs show ping -1 right after `apply`
+
+Do not remove the WARP outbound by hand as a permanent fix - that disables WARP.
+The cause was Xray choosing **kernel TUN** because the node has CAP_NET_ADMIN;
+it installs global routes/ip rules and breaks every other inbound. From 1.0.12
+the outbound uses `noKernelTun: true` (userspace), which cannot affect other
+traffic.
+
+```bash
+sudo warp-manager update --yes
+sudo warp-manager apply --yes
+```
+
+`apply` now rebuilds the snippets from the stored WARP profile and rolls the
+Core config back automatically if a node reports an error. Manual rollback is
+always available with `sudo warp-manager unapply --yes`.
+
+Do not delete the separate `WireGuard` core in Core Settings: that is a
+WireGuard server for your clients, not the WARP tunnel. The WARP tunnel is one
+`wireguard` outbound inside the **Xray** core.

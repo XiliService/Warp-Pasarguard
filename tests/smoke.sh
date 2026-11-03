@@ -955,6 +955,58 @@ check "panel_exec_probe persists the UDS transport for later runs" \
   bash -c '[[ "$1" == "docker-exec|pasarguard-pasarguard-1|/run/pasarguard.socket" ]]' _ "$exec_state"
 
 # ---------------------------------------------------------------------------
+printf '\n[8l] Userspace WireGuard outbound (does not take the node down)\n'
+mkdir -p "$WORK/wgprof/profiles/default"
+cat >"$WORK/wgprof/profiles/default/meta.env" <<'EOF'
+TAG=warp
+INTERFACE=warp
+PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+ADDRESS4=172.16.0.2/32
+ADDRESS6=fd01:db8::2/128
+PUBLIC_KEY=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo=
+ENDPOINT=engage.cloudflareclient.com:2408
+EOF
+modern_out="$(WARP_APP_DIR="$WORK/wgprof" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; MODE=xray; MODERN_XRAY=1; build_outbound_json default' 2>/dev/null || true)"
+check "WARP outbound uses noKernelTun true by default" \
+  bash -c 'printf "%s" "$1" | jq -e ".settings.noKernelTun == true" >/dev/null' _ "$modern_out"
+check "WARP outbound uses remoteDNS as an array" \
+  bash -c '[[ "$1" == *"\"remoteDNS\""* ]]' _ "$modern_out"
+check "WARP outbound no longer emits legacy kernelMode/DNS" \
+  bash -c '[[ "$1" != *kernelMode* && "$1" != *"\"DNS\""* ]]' _ "$modern_out"
+legacy_out="$(WARP_APP_DIR="$WORK/wgprof" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; MODE=xray; MODERN_XRAY=0; build_outbound_json default' 2>/dev/null || true)"
+check "--legacy-xray still emits the old kernelMode/DNS fields" \
+  bash -c '[[ "$1" == *kernelMode* && "$1" == *"\"DNS\""* ]]' _ "$legacy_out"
+check "--help documents --legacy-xray" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--legacy-xray'"
+check "apply rebuilds snippets from the stored WARP profile" \
+  bash -c "sed -n '/^cmd_apply()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'build_snippets'"
+check "apply has an automatic rollback safety net" \
+  bash -c "grep -q 'panel_rollback_core' '$ROOT/warp-manager.sh'"
+cat >"$WORK/rollback-snapshot.json" <<'EOF'
+{"id":1,"name":"Default Core Config","type":"xray","config":{"outbounds":[{"tag":"DIRECT","protocol":"freedom"}],"routing":{"rules":[]}},"exclude_inbound_tags":[],"fallbacks_inbound_tags":[]}
+EOF
+rb_body="$(WARP_APP_DIR="$WORK/rb-app" WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  panel_api() { BODY="$3"; PANEL_API_BODY="{}"; return 0; }
+  panel_rollback_core 1 "$1"
+  printf "%s" "$BODY"' _ "$WORK/rollback-snapshot.json" 2>/dev/null || true)"
+check "automatic rollback PUTs the exact pre-apply core config" \
+  bash -c 'printf %s "$1" | grep -q "Default Core Config" && printf %s "$1" | grep -q DIRECT && printf %s "$1" | grep -q xray' _ "$rb_body"
+cat >"$WORK/nodes-health.json" <<'EOF'
+{"nodes":[{"id":3,"status":"error"},{"id":1,"status":"connected"}],"total":2}
+EOF
+health="$(WARP_APP_DIR="$WORK/h-app" NODES_FILE="$WORK/nodes-health.json" \
+  WARP_MANAGER="$ROOT/warp-manager.sh" bash -c '
+  source "$WARP_MANAGER"; state_init
+  panel_api() { PANEL_API_BODY="$(cat "$NODES_FILE")"; return 0; }
+  panel_error_node_ids
+  printf "%s|%s" "$PANEL_ERROR_IDS" "$PANEL_HEALTH_AVAILABLE"' 2>/dev/null || true)"
+check "post-apply health check detects a node in error state" \
+  bash -c '[[ "$1" == "3|1" ]]' _ "$health"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \

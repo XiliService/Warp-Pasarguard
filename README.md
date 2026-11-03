@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.11
+  PasarGuard WARP Manager  v1.0.12
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -569,7 +569,7 @@ use a real owner/admin account or provide the key manually.
 
 ---
 
-## Zero-credential key creation (1.0.11)
+## Zero-credential key creation (1.0.12)
 
 `warp-manager key`, `install` and `apply` no longer need you to paste a key or
 even type an admin password when the panel database runs on the same host:
@@ -598,7 +598,7 @@ outbound/rule order, and keeps `DIRECT` first.
 
 ---
 
-## Panel discovery when no host port is published (1.0.11)
+## Panel discovery when no host port is published (1.0.12)
 
 Some PasarGuard deployments run the panel API inside a Docker network with no
 published port, so `127.0.0.1:8000` and the domain both fail. `apply` now:
@@ -618,7 +618,7 @@ Overrides: `WARP_PANEL_CONTAINER=NAME` and `WARP_PANEL_TRANSPORT=nsenter`.
 
 ---
 
-## Reaching the panel API from inside its container (1.0.11)
+## Reaching the panel API from inside its container (1.0.12)
 
 PasarGuard has three official binding modes (`config.py` / `main.py`):
 
@@ -645,3 +645,65 @@ and the first HTTP reply received (not just the last network error).
 
 Overrides: `WARP_PANEL_EXEC_UDS`, `WARP_PANEL_EXEC_SCHEME`,
 `WARP_PANEL_EXEC_HOST`, `WARP_PANEL_EXEC_PORT`.
+
+---
+
+## Why an added WARP outbound can break every config (1.0.12)
+
+Symptom: after `apply`, every client config shows `ping -1`; deleting the
+`warp` outbound and its routing rule immediately restores them. The order was
+correct - the outbound itself was the problem.
+
+Xray's `wireguard` outbound has two modes. `KernelTunSupported()` returns true
+as soon as the process has `CAP_NET_ADMIN`. Our compose patch adds exactly that
+capability for `/dev/net/tun`, so with the legacy `kernelMode: false` field
+(which recent Xray builds ignore) Xray defaults to **kernel TUN**: it creates a
+kernel WireGuard link and installs addresses, routes, sysctls and policy
+routing rules inside the node container. Those routes are global to the node and
+hijack traffic for every other inbound, so all clients go down.
+
+From 1.0.12 the generated outbound uses the current Xray schema:
+
+```json
+{
+  "tag": "warp",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "...", "address": ["172.16.0.2/32"],
+    "peers": [{"publicKey": "...", "endpoint": "engage.cloudflareclient.com:2408",
+               "allowedIPs": ["0.0.0.0/0", "::/0"]}],
+    "mtu": 1280,
+    "noKernelTun": true,
+    "remoteDNS": ["1.1.1.1", "1.0.0.1"]
+  }
+}
+```
+
+`noKernelTun: true` selects Xray's built-in userspace TCP/IP stack. It needs no
+kernel module, no TUN device, no NET_ADMIN, and cannot touch the node's routing
+table. `--legacy-xray` restores the old fields for very old Xray builds only.
+
+`apply` now also:
+
+* Rebuilds `outbound/*.json` from the stored wgcf profile **every time**, so a
+  script update fixes an already-installed deployment without reinstalling.
+* Reads node health from `/api/nodes` before and after the change, and
+  automatically PUTs the exact pre-apply Core config back if a node enters
+  `error` state. `warp-manager unapply --yes` remains a manual rollback.
+
+## The two PasarGuard cores
+
+The `CoreType` enum is `xray | wg | mtproto | singbox`, and a panel may hold
+several Core configs at once.
+
+* **Xray core** (`Default Core Config`) - owns Inbounds, Outbounds, Routing,
+  Balancers and DNS. This is the core the manager edits (core ID 1 in the
+  default install).
+* **WireGuard core** (`wg`) - a separate WireGuard **server** for clients. Its
+  Interface tab (`wg0`, listen port 51820, `10.0.0.1/8`, private/public key)
+  is the server-side tunnel that hands out client subnets. It is NOT the
+  Cloudflare WARP client tunnel and must not be edited or deleted.
+
+Cloudflare WARP here is a third thing: a single `wireguard` **outbound inside
+the Xray core**, selecting which domains leave through Cloudflare. It does not
+create a new panel core.

@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.11"
+readonly SCRIPT_VERSION="1.0.12"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -88,7 +88,7 @@ INSECURE="${WARP_INSECURE:-0}"
 UPDATE_CHECK_ONLY=0
 LOG_LINES=80
 LOG_FOLLOW=0
-MODERN_XRAY=0
+MODERN_XRAY=1
 REMOVE_ALL=0
 BINDING_PRESET="${WARP_BINDING:+1}"
 BINDING_PRESET="${BINDING_PRESET:-0}"
@@ -105,6 +105,7 @@ WGCF_ARCH="amd64"; DETECTED_ROLE="unknown"
 PRIMARY_IP=""; DEFAULT_ROUTE=""; DEFAULT_GW=""; DEFAULT_DEV=""
 XRAY_VERSION="unknown"; COMPOSE_SERVICES=""
 COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""; PANEL_APPLY_OK=0
+HANDLED_ERROR=0
 PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
 PANEL_BEST_HTTP=""; PANEL_BEST_BODY=""; PANEL_BEST_URL=""
 ALLOW_LOCAL_PANEL="0"
@@ -837,19 +838,26 @@ build_outbound_json() {
       {
         tag: $tag,
         protocol: "wireguard",
-        settings: {
-          secretKey: $key,
-          DNS: "1.1.1.1",
-          address: ([$a4] + (if $a6 != "" and $a6 != $a4 then [$a6] else [] end)),
-          peers: [ { publicKey: $pub, endpoint: $ep, allowedIPs: ["0.0.0.0/0", "::/0"] } ],
-          kernelMode: false,
-          mtu: 1280
-        }
+        settings: (
+          {
+            secretKey: $key,
+            address: ([$a4] + (if $a6 != "" and $a6 != $a4 then [$a6] else [] end)),
+            peers: [ { publicKey: $pub, endpoint: $ep,
+                       allowedIPs: ["0.0.0.0/0", "::/0"] } ],
+            mtu: 1280
+          }
+          # Xray >= 1.8 uses noKernelTun. With noKernelTun absent Xray sees
+          # CAP_NET_ADMIN (we add it for /dev/net/tun) and installs a KERNEL
+          # WireGuard link plus global routes/ip rules inside the node, which
+          # breaks every other config. Userspace netstack is self-contained.
+          | if $modern == 1 then
+              . + { noKernelTun: true, remoteDNS: ["1.1.1.1", "1.0.0.1"] }
+            else
+              . + { kernelMode: false, DNS: "1.1.1.1" }
+            end
+        )
       }
-      | if $send != "" then . + { sendThrough: $send } else . end
-      | if $modern == 1 then
-          .settings += { noKernelTun: true, remoteDNS: ["1.1.1.1", "1.0.0.1"] }
-        else . end'
+      | if $send != "" then . + { sendThrough: $send } else . end'
   fi
 }
 
@@ -915,6 +923,10 @@ build_snippets() {
     if (( ${#names[@]} > 1 )); then
       printf '3) Paste objects from balancers.json into "routing.balancers".\n'
     fi
+    printf '\nWARP outbound uses noKernelTun: true (userspace WireGuard). It does NOT\n'
+    printf 'create a kernel WireGuard link or add routes/ip rules inside the node.\n'
+    printf 'Do not use kernelMode on recent Xray builds: with CAP_NET_ADMIN it can\n'
+    printf 'hijack the node routing table and break every other config.\n'
     printf '\nWARNING: this script never edits the panel database directly unless\n'
     printf '"Apply to Panel (API)" is explicitly selected.\n'
   } >"$OUTPUT_DIR/README.txt"
@@ -1838,6 +1850,38 @@ merge_core_config() {
      ' "$core_file" >"$out_file"
 }
 
+# Node health for the post-apply safety check. Returns a comma-separated list
+# of node IDs currently in "error" state; silently yields nothing if the API
+# key lacks the nodes:read permission or the panel is unreachable.
+PANEL_HEALTH_AVAILABLE=0
+PANEL_ERROR_IDS=""
+PANEL_ERROR_BEFORE=""
+# Sets globals directly (never call in $(...): a subshell would discard them).
+panel_error_node_ids() {
+  PANEL_ERROR_IDS=""
+  PANEL_HEALTH_AVAILABLE=0
+  panel_api GET "/nodes" 2>/dev/null || return 0
+  PANEL_HEALTH_AVAILABLE=1
+  PANEL_ERROR_IDS="$(jq -r '[.nodes[]? | select(.status == "error") | (.id | tostring)] | sort | join(",")' \
+      <<<"$PANEL_API_BODY" 2>/dev/null || true)"
+  return 0
+}
+
+# PUT the exact pre-apply Core config back.
+panel_rollback_core() {
+  local core_id="$1" snapshot="$2" body
+  [[ -f "$snapshot" ]] || return 1
+  body="$(jq -n --slurpfile c "$snapshot" '{
+      name: ($c[0].name),
+      config: ($c[0].config),
+      type: ($c[0].type // null),
+      exclude_inbound_tags: ($c[0].exclude_inbound_tags // []),
+      fallbacks_inbound_tags: ($c[0].fallbacks_inbound_tags // [])
+    }')" || return 1
+  panel_api PUT "/core/${core_id}?restart_nodes=true" "$body" || return 1
+  return 0
+}
+
 apply_to_panel() {
   local action="${1:-apply}"
   PANEL_APPLY_OK=0
@@ -1847,6 +1891,8 @@ apply_to_panel() {
   fi
   have jq || die "jq is required for panel API integration."
   panel_login || { warn "Could not authenticate. Panel snippets are still available for manual paste."; return 0; }
+  panel_error_node_ids
+  PANEL_ERROR_BEFORE="$PANEL_ERROR_IDS"
 
   local core_id="$PANEL_CORE_ID"
   if [[ -z "$core_id" ]]; then
@@ -2541,6 +2587,22 @@ cmd_apply() {
   else
     info "Removing the WARP outbound/rules from the panel Core Settings."
   fi
+  if [[ "$action" == "apply" ]]; then
+    # Always rebuild the snippets from the stored wgcf profile. A script update
+    # that fixes the WireGuard outbound must take effect WITHOUT reinstalling.
+    local names_csv; names_csv="$(profile_list)"
+    if [[ -n "$names_csv" ]]; then
+      local -a profiles=()
+      read -r -a profiles <<<"$names_csv"
+      MODE="$(state_get MODE xray)"
+      BINDING="$(state_get BINDING single)"
+      ROUTING="$(state_get ROUTING domains)"
+      DOMAINS_CSV="$(state_get DOMAINS "$DEFAULT_DOMAINS")"
+      ENDPOINT="$(state_get ENDPOINT "$DEFAULT_ENDPOINT")"
+      build_snippets "${profiles[@]}" || die "Could not rebuild the WARP snippets."
+      info "Rebuilt the WARP outbound from the stored WARP profile (userspace WireGuard)."
+    fi
+  fi
   local f
   for f in outbounds.json routing-rules.json balancers.json; do
     [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
@@ -2549,6 +2611,29 @@ cmd_apply() {
   [[ "$PANEL_APPLY_OK" == "1" ]] || die \
     "Panel config was NOT applied. Read the error above, or paste the snippets manually (see ${OUTPUT_DIR}/README.txt)."
   if [[ "$action" == "apply" ]]; then
+    # Safety net: if a node went into "error" after the change, restore the
+    # exact pre-apply Core config automatically instead of leaving all users
+    # disconnected.
+    info "Verifying node health after the change (10s)..."
+    sleep 10
+    panel_error_node_ids
+    local after="$PANEL_ERROR_IDS"
+    if [[ "$PANEL_HEALTH_AVAILABLE" == "1" && -n "$after" && "$after" != "$PANEL_ERROR_BEFORE" ]]; then
+      error "A node reported an error after applying WARP. Rolling back automatically."
+      local rb_core rb_snap
+      rb_core="$(state_get PANEL_CORE_ID '')"
+      rb_snap="$(state_get PANEL_LAST_BACKUP '')"
+      if [[ -n "$rb_core" && -n "$rb_snap" && -f "$rb_snap" ]] && \
+         panel_rollback_core "$rb_core" "$rb_snap"; then
+        warn "Rolled back to ${rb_snap}. Your other configs are restored."
+        state_set PANEL_LAST_APPLY "rolled-back"
+        HANDLED_ERROR=1
+        return 1
+      fi
+      error "Automatic rollback failed. Run: warp-manager unapply --yes"
+      HANDLED_ERROR=1
+      return 1
+    fi
     ok "WARP is now ACTIVE in the panel config."
     info "Final test, from a CLIENT config: https://ipinfo.io/json with 'tunnel' vs 'direct'."
   else
@@ -3198,7 +3283,8 @@ Install options:
   --domains LIST            Comma separated domain list for routing rules
   --license KEY             Optional WARP+ license key
   --wgcf-version TAG|latest wgcf release tag (default: v2.2.22)
-  --modern-xray             Add noKernelTun / remoteDNS for recent Xray builds
+  --modern-xray             Use userspace WireGuard (default; safe inside Docker)
+  --legacy-xray            Use legacy kernelMode/DNS fields (old Xray only)
 
 Panel API options (optional):
   --panel-url URL           Panel base URL, e.g. https://panel.example.com
@@ -3266,6 +3352,7 @@ parse_args() {
       --license) LICENSE_KEY="$2"; shift 2 ;;
       --wgcf-version) WGCF_VERSION="$2"; shift 2 ;;
       --modern-xray) MODERN_XRAY=1; shift ;;
+      --legacy-xray) MODERN_XRAY=0; shift ;;
       --panel-url) PANEL_URL="$2"; shift 2 ;;
       --panel-user) PANEL_USER="$2"; shift 2 ;;
       --panel-pass) PANEL_PASS="$2"; shift 2 ;;
@@ -3309,6 +3396,9 @@ require_root() {
 
 on_error() {
   local rc=$? lineno="${BASH_LINENO[0]:-$1}"
+  # A handled failure (e.g. an automatic rollback) already printed its own
+  # clear message; do not add the scary generic "Unexpected failure" line.
+  if [[ "${HANDLED_ERROR:-0}" == "1" ]]; then return 0; fi
   [[ -z "$lineno" || "$lineno" == "0" ]] && lineno="unknown"
   error "Unexpected failure at line ${lineno} (exit ${rc}). Check ${LOG_FILE} for details."
   if [[ "${ROUTE_GUARD:-0}" == "1" ]]; then
