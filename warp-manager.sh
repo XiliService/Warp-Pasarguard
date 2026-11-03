@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.6"
+readonly SCRIPT_VERSION="1.0.7"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -71,6 +71,8 @@ LICENSE_KEY="${WARP_LICENSE_KEY:-}"
 PANEL_URL="${PANEL_URL:-}"
 PANEL_USER="${PANEL_USER:-}"
 PANEL_PASS="${PANEL_PASS:-}"
+PANEL_API_KEY="${PANEL_API_KEY:-}"
+PANEL_AUTH_MODE="token"
 PANEL_TOKEN="${PANEL_TOKEN:-}"
 PANEL_CORE_ID="${PANEL_CORE_ID:-}"
 APPLY_PANEL="${WARP_APPLY_PANEL:-auto}"
@@ -108,7 +110,7 @@ ROUTE_BEFORE=""
 COMPOSE_FILE=""
 COMPOSE_SERVICES=""
 PANEL_ACCESS_TOKEN=""
-RULE_PREPEND=1
+RULE_PREPEND=0  # default ROUTING=domains; never make WARP the default outbound
 
 # -----------------------------------------------------------------------------
 # Colours (only when attached to a terminal)
@@ -881,12 +883,18 @@ build_snippets() {
     printf 'Mode: %s | Target: %s | Binding: %s | Routing: %s\n\n' "$MODE" "$TARGET" "$BINDING" "$ROUTING"
     printf 'Panel path: Core Settings -> select the Core used by the EXIT NODE -> edit JSON.\n\n'
     printf '1) Paste every object from outbounds.json into the "outbounds" array.\n'
+    printf '   ORDER MATTERS: the FIRST outbound is the default for unmatched traffic.\n'
     if [[ "$ROUTING" == "all" ]]; then
       printf '   Put the WARP outbound first so it becomes the default outbound.\n'
     else
-      printf '   Keep your existing first outbound first; WARP is used only by rules.\n\n'
-      printf '2) Paste objects from routing-rules.json at the TOP of "routing.rules".\n'
+      printf '   Keep your existing first outbound (DIRECT) first. Put WARP after the\n'
+      printf '   location outbounds and BEFORE any BLOCK/blackhole outbound.\n'
     fi
+    printf '2) Paste objects from routing-rules.json into "routing.rules".\n'
+    printf '   ORDER MATTERS: Xray checks rules top-down; the FIRST match wins.\n'
+    printf '   The WARP rule must be ABOVE every catch-all inbound rule such as\n'
+    printf '   Germany -> Out-DE, otherwise those rules win and WARP is never used.\n'
+    printf '   Keep any leading BLOCK/security rule above the WARP rule.\n' 
     if (( ${#names[@]} > 1 )); then
       printf '3) Paste objects from balancers.json into "routing.balancers".\n'
     fi
@@ -1166,6 +1174,42 @@ panel_endpoint() {
   printf '%s' "${PANEL_URL%/}/api"
 }
 
+load_saved_api_key() {
+  [[ -n "$PANEL_API_KEY" ]] && return 0
+  local k; k="$(state_get PANEL_API_KEY '')"
+  if [[ -n "$k" ]]; then PANEL_API_KEY="$k"; fi
+  return 0
+}
+
+# Read-only probe: PasarGuard accepts an API key via the X-Api-Key header
+# (Authorization: ApiKey <key> also works). A valid /api/cores response is
+# {"count":N,"cores":[...]}, which lets us identify the correct panel URL.
+panel_probe_key() {
+  local base="$1" k="$2" tmp err code body
+  tmp="$(mktemp)"; err="$(mktemp)"
+  local -a opts=(-sS -X GET --connect-timeout 5 --max-time 15 \
+                 -H "X-Api-Key: ${PANEL_API_KEY}" \
+                 -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
+  if [[ "$k" == "1" ]]; then opts+=(-k); fi
+  PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
+  # NOTE: the panel uses APIRouter(prefix="/api/core") + @router.get("s"),
+  # so the list endpoint is /api/cores (NOT /api/core/s).
+  code="$(curl "${opts[@]}" "${base%/}/api/cores" 2>"$err")" || {
+    PANEL_NETERR="$(tr '\n' ' ' < "$err" | cut -c1-240)"
+    rm -f -- "$tmp" "$err"; return 1
+  }
+  rm -f -- "$err"
+  body="$(cat "$tmp")"; rm -f -- "$tmp"
+  PANEL_HTTP="$code"
+  PANEL_BODY="$(printf '%s' "$body" | head -c 240)"
+  if [[ ! "$code" =~ ^2 ]]; then return 1; fi
+  if ! jq -e '(.cores | type) == "array"' <<<"$body" >/dev/null 2>&1; then
+    PANEL_HTTP="invalid-shape"
+    return 1
+  fi
+  return 0
+}
+
 # Panel containers running on THIS host can be reached directly, which helps
 # when the public dashboard domain does not resolve (or is firewalled) from
 # the VPS itself. Read-only discovery; nothing is changed here.
@@ -1235,6 +1279,44 @@ panel_try_login() {
 }
 
 panel_login() {
+  if [[ -n "$PANEL_API_KEY" ]]; then
+    PANEL_AUTH_MODE="api-key"
+    PANEL_ACCESS_TOKEN="$PANEL_API_KEY"
+    local configured="${PANEL_URL:-}" b url k pass
+    local -a urls=() passes=(1)
+    [[ "$INSECURE" == "1" ]] || passes+=(2)
+    if [[ -n "$configured" ]]; then urls+=("$configured"); fi
+    while IFS= read -r b; do
+      [[ -n "$b" ]] || continue
+      [[ " ${urls[*]:-} " == *" ${b} "* ]] || urls+=("$b")
+    done < <(local_panel_urls)
+    while IFS= read -r b; do
+      [[ -n "$b" ]] || continue
+      [[ " ${urls[*]:-} " == *" ${b} "* ]] || urls+=("$b")
+    done < <(local_port_probes)
+    if (( ${#urls[@]} == 0 )); then
+      error "No panel URL configured and no local panel found."
+      return 1
+    fi
+    info "Checking ${#urls[@]} candidate panel endpoint(s) with the API key."
+    for pass in "${passes[@]}"; do
+      for url in "${urls[@]}"; do
+        k=0
+        if [[ "$pass" == "2" || "$INSECURE" == "1" ]]; then k=1; fi
+        if panel_probe_key "$url" "$k"; then
+          PANEL_URL="$url"; INSECURE="$k"
+          ok "Panel API key accepted at ${url}"
+          return 0
+        fi
+      done
+    done
+    error "The API key did not work on any panel endpoint."
+    if [[ -n "$PANEL_NETERR" ]]; then error "  Last network error: ${PANEL_NETERR}"; fi
+    error "  Last response (HTTP ${PANEL_HTTP}): ${PANEL_BODY}"
+    warn "Create the key in Panel -> API Keys with cores:read + cores:update."
+    warn "It must look like pg_key_<uuid>. Set --panel-url if the panel is remote."
+    return 1
+  fi
   if [[ -n "$PANEL_TOKEN" ]]; then
     PANEL_ACCESS_TOKEN="$PANEL_TOKEN"
     return 0
@@ -1313,8 +1395,12 @@ panel_api() {
   local bodyfile code
   bodyfile="$(mktemp)"
   local -a opts=(-sS -X "$method" --connect-timeout 10 --max-time 45 \
-                 -H "Authorization: Bearer ${PANEL_ACCESS_TOKEN}" \
                  -H 'Accept: application/json' -o "$bodyfile" -w '%{http_code}')
+  if [[ "$PANEL_AUTH_MODE" == "api-key" ]]; then
+    opts+=(-H "X-Api-Key: ${PANEL_ACCESS_TOKEN}")
+  else
+    opts+=(-H "Authorization: Bearer ${PANEL_ACCESS_TOKEN}")
+  fi
   [[ "$INSECURE" == "1" ]] && opts+=(-k)
   if [[ -n "$data" ]]; then
     opts+=(-H 'Content-Type: application/json' --data-binary "$data")
@@ -1343,14 +1429,34 @@ merge_core_config() {
      '
      def ours: (.tag // "") | test("^warp(-|$)");
      def our_rule: ((.outboundTag // "") | test("^warp(-|$)")) or (.balancerTag == "warp-pool");
+     def is_block: (((.tag // "") | ascii_downcase) | test("block|blackhole"))
+                   or (((.protocol // "") | ascii_downcase) | test("blackhole"));
+     def is_block_rule: (.outboundTag // "") | ascii_downcase | test("block|blackhole");
      .config
      | .outbounds = ([ (.outbounds // [])[] | select(ours | not) ])
      | .routing   = (.routing // {})
      | .routing.rules = ([ (.routing.rules // [])[] | select(our_rule | not) ])
      | .routing.balancers = ([ (.routing.balancers // [])[] | select(.tag != "warp-pool") ])
      | if $apply == 1 then
-         .outbounds = (if $prepend == 1 then ($obs[0] + .outbounds) else (.outbounds + $obs[0]) end)
-         | .routing.rules = ($rules[0] + .routing.rules)
+         # Outbound order: the FIRST outbound is the default. Keep it untouched.
+         # Insert WARP after the real freedom outbounds but BEFORE any trailing
+         # BLOCK/blackhole outbound.
+         (if $prepend == 1 then
+            .outbounds = ($obs[0] + .outbounds)
+          else
+            (.outbounds // []) as $o
+            | ([ range(0; ($o|length)) as $i
+                 | select($o[$i] | is_block) | $i ] | min // ($o|length)) as $cut
+            | .outbounds = ($o[0:$cut] + $obs[0] + $o[$cut:])
+          end)
+         # Rule order: Xray evaluates top-down, first match wins. Inbound-based
+         # catch-all rules (Germany -> Out-DE, ...) must NOT shadow the WARP
+         # domains rule. Keep leading BLOCK/security rules above it.
+         | (.routing.rules // []) as $r
+         | ([ range(0; ($r|length)) as $i
+              | select(($r[$i] | is_block_rule) | not) | $i ]
+            | min // ($r|length)) as $rcut
+         | .routing.rules = ($r[0:$rcut] + $rules[0] + $r[$rcut:])
          | .routing.balancers = (.routing.balancers + $bals[0])
          | if (.routing.balancers | length) == 0 then del(.routing.balancers) else . end
        else . end
@@ -1360,7 +1466,10 @@ merge_core_config() {
 apply_to_panel() {
   local action="${1:-apply}"
   PANEL_APPLY_OK=0
-  [[ -n "$PANEL_URL" ]] || { warn "Panel URL not configured; skipping API apply."; return 0; }
+  if [[ -z "$PANEL_URL" && -z "$PANEL_API_KEY" ]]; then
+    warn "Panel URL and API key are not configured; skipping API apply."
+    return 0
+  fi
   have jq || die "jq is required for panel API integration."
   panel_login || { warn "Could not authenticate. Panel snippets are still available for manual paste."; return 0; }
 
@@ -1404,7 +1513,9 @@ apply_to_panel() {
   jq -n --slurpfile before "$snapshot" --slurpfile after "$merged" '
     { outbound_count: { before: ($before[0].config.outbounds | length), after: ($after[0] | .outbounds | length) },
       rule_count:     { before: ($before[0].config.routing.rules // [] | length), after: ($after[0].routing.rules | length) },
-      first_outbound: ($after[0].outbounds[0].tag // "unchanged") }' || true
+      first_outbound: ($after[0].outbounds[0].tag // "unchanged"),
+      outbound_order: [ $after[0].outbounds[].tag ],
+      first_rules: [ $after[0].routing.rules[0:3][] | (.outboundTag // .balancerTag // "?") ] }' || true
   if ! confirm "Apply this change to the panel now?"; then
     warn "Skipped. Preview saved at ${merged}."
     cp -f -- "$merged" "$OUTPUT_DIR/core-config-preview.json"
@@ -1425,7 +1536,9 @@ apply_to_panel() {
   }
   ok "Core config ${core_id} updated and nodes notified."
   PANEL_APPLY_OK=1
-  state_set_many "PANEL_URL=$PANEL_URL" "PANEL_CORE_ID=$core_id" "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PANEL_LAST_BACKUP=$snapshot"
+  state_set_many "PANEL_URL=$PANEL_URL" "PANEL_API_KEY=$PANEL_API_KEY" \
+    "PANEL_AUTH_MODE=$PANEL_AUTH_MODE" "PANEL_CORE_ID=$core_id" \
+    "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PANEL_LAST_BACKUP=$snapshot"
   cp -f -- "$merged" "$OUTPUT_DIR/core-config-preview.json"
   rm -f -- "$merged"
 }
@@ -1647,9 +1760,27 @@ choose_optional() {
   [[ -n "$ans" ]] && LICENSE_KEY="$ans"
   ans="$(ui_read "WARP endpoint [${ENDPOINT}]: ")" || return 1
   [[ -n "$ans" ]] && ENDPOINT="$ans"
+  if [[ -z "$PANEL_API_KEY" ]]; then
+    ans="$(ui_read_secret "Panel API key (Panel -> API Keys, pg_key_...; Enter to skip): ")" || return 1
+    if [[ -n "$ans" ]]; then
+      PANEL_API_KEY="$ans"
+      APPLY_PANEL="yes"
+    fi
+  fi
   if [[ -z "$PANEL_URL" ]]; then
-    ans="$(ui_read "Panel API base URL to auto-apply config (optional, e.g. https://panel.example.com): ")" || return 1
+    ans="$(ui_read "Panel URL (Enter = auto-detect when an API key is set): ")" || return 1
     if [[ -n "$ans" ]]; then PANEL_URL="$ans"; fi
+  fi
+  if [[ -n "$PANEL_API_KEY" ]]; then
+    return 0
+  fi
+  if [[ -n "$PANEL_URL" && -z "$PANEL_USER" ]]; then
+    ans="$(ui_read "Panel admin username (Enter to skip manual API login): ")" || return 1
+    PANEL_USER="$ans"
+    if [[ -n "$PANEL_USER" ]]; then
+      ans="$(ui_read_secret "Panel admin password: ")" || return 1
+      PANEL_PASS="$ans"
+    fi
   fi
   return 0
 }
@@ -1662,7 +1793,11 @@ install_plan() {
   printf '  %-22s %s\n' "Routing" "$ROUTING"
   printf '  %-22s %s\n' "Domains" "$DOMAINS_CSV"
   printf '  %-22s %s\n' "Endpoint" "$ENDPOINT"
-  printf '  %-22s %s\n' "Panel API" "${PANEL_URL:-not configured (manual paste)}"
+  if [[ -n "$PANEL_API_KEY" ]]; then
+    printf '  %-22s %s\n' "Panel API" "${PANEL_URL:-auto-detect} (API key: set)"
+  else
+    printf '  %-22s %s\n' "Panel API" "${PANEL_URL:-not configured (manual paste)}"
+  fi
   if [[ "$BINDING" == "per-ip" ]]; then
     local i
     for i in "${!PERIP_IPS[@]}"; do
@@ -1759,9 +1894,10 @@ cmd_install() {
     "INSTALLED=1" "MODE=$MODE" "TARGET=$TARGET" "BINDING=$BINDING" \
     "ROUTING=$ROUTING" "ENDPOINT=$ENDPOINT" "DOMAINS=$DOMAINS_CSV" \
     "PROFILES=${names[*]}" "INSTALLED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
-    "SCRIPT_VERSION=$SCRIPT_VERSION" "STATE_VERSION=1" "PANEL_URL=$PANEL_URL"
+    "SCRIPT_VERSION=$SCRIPT_VERSION" "STATE_VERSION=1" "PANEL_URL=$PANEL_URL" \
+    "PANEL_API_KEY=$PANEL_API_KEY"
 
-  if [[ "$APPLY_PANEL" != "no" && -n "$PANEL_URL" ]]; then
+  if [[ "$APPLY_PANEL" != "no" && ( -n "$PANEL_URL" || -n "$PANEL_API_KEY" ) ]]; then
     apply_to_panel apply
   else
     header "Manual panel step"
@@ -1786,9 +1922,9 @@ cmd_snippets() {
   for f in outbounds.json routing-rules.json balancers.json README.txt; do
     [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
   done
-  printf '\n--- 1) outbounds.json : paste objects into "outbounds" AFTER the existing first outbound ---\n'
+  printf '\n--- 1) outbounds.json : paste into "outbounds" AFTER the first outbound, BEFORE any BLOCK ---\n'
   cat "$OUTPUT_DIR/outbounds.json"
-  printf '\n--- 2) routing-rules.json : paste objects at the TOP of "routing.rules" ---\n'
+  printf '\n--- 2) routing-rules.json : paste ABOVE all inbound->outbound rules (first match wins) ---\n'
   cat "$OUTPUT_DIR/routing-rules.json"
   printf '\n--- 3) balancers.json (single mode: empty, nothing to paste) ---\n'
   cat "$OUTPUT_DIR/balancers.json"
@@ -1828,9 +1964,12 @@ cmd_fix_compose() {
 cmd_apply() {
   local action="${1:-apply}"
   state_init
+  load_saved_api_key
   header "$APP_NAME v$SCRIPT_VERSION - Apply Panel Config (${action})"
   have jq || die "jq is required for panel API integration."
-  [[ -n "$PANEL_URL" ]] || die "Panel URL is required. Use --panel-url URL or PANEL_URL=... ."
+  if [[ -z "$PANEL_URL" && -z "$PANEL_API_KEY" ]]; then
+    die "Provide --panel-key KEY (recommended), or --panel-url URL with admin credentials."
+  fi
   local saved_routing
   saved_routing="$(state_get ROUTING domains)"
   if [[ "$saved_routing" == "all" ]]; then RULE_PREPEND=1; else RULE_PREPEND=0; fi
@@ -2178,13 +2317,11 @@ cmd_status() {
 
   if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
     header "Next step"
-    info "  1) warp-manager snippets"
-    info "     Paste outbounds.json + routing-rules.json into Core Settings, Save."
-    info "  2) warp-manager mark-applied --yes"
-    info "  Alternative (needs a reachable panel API):"
-    local next_url; next_url="$(state_get PANEL_URL '')"
-    [[ -n "$next_url" ]] || next_url="PANEL_URL"
-    info "     warp-manager apply --panel-url ${next_url} --panel-user USER --panel-pass PASS --yes"
+    info "  Recommended: create an API key in Panel -> API Keys, then:"
+    info "     warp-manager apply --panel-key pg_key_... --yes"
+    info "     (It fixes outbound/rule order automatically; URL is auto-detected.)"
+    info "  Without an API key: warp-manager snippets, paste into Core Settings,"
+    info "     Save, then warp-manager mark-applied --yes"
     line
   fi
   if (( problems == 0 )); then
@@ -2284,6 +2421,7 @@ Panel API options (optional):
   --panel-url URL           Panel base URL, e.g. https://panel.example.com
   --panel-user USER         Admin username
   --panel-pass PASS         Admin password
+  --panel-key KEY           Panel API key (pg_key_...); preferred, no login needed
   --panel-token TOKEN       Bearer token instead of username/password
   --core-id ID              Core configuration ID to modify
   --apply-panel             Force API apply
@@ -2309,7 +2447,7 @@ Environment variables:
   WARP_BINDING, WARP_SRC_IP, WARP_LABEL, WARP_LABELS, WARP_ENDPOINT, WARP_ROUTING,
   WARP_DOMAINS, WARP_LICENSE_KEY, WARP_APPLY_PANEL, WGCF_VERSION,
   WARP_YES, WARP_DRY_RUN, WARP_FORCE, WARP_INSECURE, WARP_DEBUG,
-  PANEL_URL, PANEL_USER, PANEL_PASS, PANEL_TOKEN, PANEL_CORE_ID
+  PANEL_URL, PANEL_USER, PANEL_PASS, PANEL_TOKEN, PANEL_API_KEY, PANEL_CORE_ID
 
 Examples:
   warp-manager
@@ -2317,6 +2455,7 @@ Examples:
   warp-manager install --mode kernel --target exit --ip 203.0.113.10
   warp-manager status
   warp-manager update --check
+  warp-manager apply --panel-key pg_key_... --yes
   warp-manager apply --panel-url https://panel.example.com \
     --panel-user admin --panel-pass 'secret' --core-id 1 --yes
 EOF
@@ -2342,6 +2481,7 @@ parse_args() {
       --panel-user) PANEL_USER="$2"; shift 2 ;;
       --panel-pass) PANEL_PASS="$2"; shift 2 ;;
       --panel-token) PANEL_TOKEN="$2"; shift 2 ;;
+      --panel-key) PANEL_API_KEY="$2"; shift 2 ;;
       --core-id) PANEL_CORE_ID="$2"; shift 2 ;;
       --apply-panel) APPLY_PANEL="yes"; shift ;;
       --no-apply-panel) APPLY_PANEL="no"; shift ;;

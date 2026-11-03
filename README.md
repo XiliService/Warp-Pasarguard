@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.6
+  PasarGuard WARP Manager  v1.0.7
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -495,3 +495,31 @@ walkthrough), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 When the panel API is not reachable at all, skip it: `warp-manager snippets`
 prints the exact JSON to paste into Core Settings, and
 `warp-manager mark-applied --yes` records that the manual step is done.
+
+---
+
+## API key (recommended way to apply Core Settings)
+
+Create a key in **Panel -> API Keys** with `cores:read` + `cores:update`
+permissions (or "inherit permissions" on an owner account). It looks like
+`pg_key_<uuid>`. The manager sends it as `X-Api-Key`; it never calls
+`/api/admin/token`, so a broken login/404 on that route is irrelevant.
+
+```bash
+sudo warp-manager apply --panel-key pg_key_... --yes
+```
+
+The panel URL is optional: the manager probes the configured URL, the ports of
+any local `pasarguard/panel` container, and common local ports, then uses the
+first endpoint that returns a valid `/api/cores` response. The key is stored in
+`/opt/pasarguard-warp/state.env` (mode 0600) for later `apply` / `unapply`.
+
+## Ordering rules (important)
+
+* **Outbounds:** the FIRST outbound is Xray's default for unmatched traffic.
+  The manager keeps `DIRECT` first and inserts `warp` after the location
+  outbounds but BEFORE any `BLOCK`/`blackhole` outbound (unless `routing=all`).
+* **Routing rules:** Xray evaluates top-down and the FIRST match wins. The
+  WARP domains rule must be ABOVE catch-all inbound rules such as
+  `Germany -> Out-DE`; otherwise those rules win and WARP is never used.
+  Leading `BLOCK`/security rules stay above the WARP rule.

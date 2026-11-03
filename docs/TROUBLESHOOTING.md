@@ -181,3 +181,18 @@ sudo warp-manager snippets
 sudo warp-manager mark-applied --yes
 sudo warp-manager status
 ```
+
+---
+
+## `ipinfo.io` still shows the server IP after adding WARP
+
+Almost always a **rule order** problem. Inbound-based catch-all rules
+(`Germany -> Out-DE`, `NetherLands -> Out-NL`, ...) have no domain filter, so
+they match first and the WARP domains rule at the bottom is never reached.
+
+* Move the WARP rule ABOVE those rules (keep any leading BLOCK rule above it).
+* Check the outbound list too: `DIRECT` must remain first; `warp` belongs after
+  the location outbounds and before `BLOCK`.
+
+`warp-manager apply --panel-key pg_key_... --yes` rewrites both lists in the
+correct order automatically and backs up the core config first.

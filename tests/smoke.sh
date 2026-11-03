@@ -56,7 +56,7 @@ check "--help documents the apply command" \
 check "--help documents the fix-compose command" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'fix-compose Re-detect'"
 apply_err="$(WARP_APP_DIR="$WORK/apply-app" bash "$ROOT/warp-manager.sh" apply --yes 2>&1 || true)"
-if printf '%s' "$apply_err" | grep -q 'Panel URL is required'; then
+if printf '%s' "$apply_err" | grep -q 'Provide --panel-key KEY'; then
   t_ok "apply without a panel URL fails with a clear message"
 else
   t_fail "apply without a panel URL fails with a clear message"
@@ -141,7 +141,7 @@ install_plan >/dev/null 2>&1
 printf 'WIZARD_OK target=%s mode=%s binding=%s routing=%s' \
   "$TARGET" "$MODE" "$BINDING" "$ROUTING"
 EOF
-wizard_out="$(printf '1\n1\n1\n1\n\n\n\n\n' \
+wizard_out="$(printf '1\n1\n1\n1\n\n\n\n\n\n\n\n\n' \
   | WARP_APP_DIR="$WORK/wizard-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
     bash "$WORK/wizard.sh" 2>/dev/null || true)"
 check "wizard survives empty Enter answers (set -e regression)" \
@@ -556,6 +556,126 @@ check "mark-applied records the manual apply" \
 stat_out="$(WARP_APP_DIR="$WORK/snip-app" bash "$ROOT/warp-manager.sh" status 2>&1 || true)"
 check "status shows the config as applied (manual)" \
   bash -c '[[ "$1" == *"Panel config applied (manual)"* ]]' _ "$stat_out"
+
+# ---------------------------------------------------------------------------
+printf '\n[8f] Real-world core order (DIRECT / Out-DE / Out-NL / Out-PL / warp / BLOCK)\n'
+mkdir -p "$WORK/order-app/outbound"
+cat >"$WORK/order-app/core.json" <<'JSON'
+{"name":"foreign","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],
+ "config":{
+  "outbounds":[
+    {"tag":"DIRECT","protocol":"freedom"},
+    {"tag":"Out-DE","protocol":"freedom","sendThrough":"147.90.59.188"},
+    {"tag":"Out-NL","protocol":"freedom","sendThrough":"95.135.200.231"},
+    {"tag":"Out-PL","protocol":"freedom","sendThrough":"91.124.209.148"},
+    {"tag":"warp","protocol":"wireguard"},
+    {"tag":"BLOCK","protocol":"blackhole"}],
+  "routing":{"rules":[
+    {"type":"field","outboundTag":"BLOCK","ip":["geoip:private"]},
+    {"type":"field","inboundTag":["Germany"],"outboundTag":"Out-DE"},
+    {"type":"field","inboundTag":["NetherLands"],"outboundTag":"Out-NL"},
+    {"type":"field","inboundTag":["Poland"],"outboundTag":"Out-PL"},
+    {"type":"field","inboundTag":["SOCKS5"],"outboundTag":"Out-PL"},
+    {"type":"field","outboundTag":"warp","domain":["geosite:google","openai.com"]}]}}}
+JSON
+printf '[{"tag":"warp","protocol":"wireguard","settings":{"secretKey":"NEWKEY"}}]\n' \
+  > "$WORK/order-app/outbound/outbounds.json"
+printf '[{"type":"field","outboundTag":"warp","domain":["geosite:google","openai.com","ipinfo.io"]}]\n' \
+  > "$WORK/order-app/outbound/routing-rules.json"
+printf '[]\n' > "$WORK/order-app/outbound/balancers.json"
+WARP_APP_DIR="$WORK/order-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  RULE_PREPEND=0 bash -c '
+    source "$WARP_MANAGER"
+    RULE_PREPEND=0
+    merge_core_config "'"$WORK"'/order-app/core.json" "'"$WORK"'/order-app/merged.json" apply' || true
+assert_eq "outbound order keeps DIRECT first and puts warp before BLOCK" \
+  "DIRECT Out-DE Out-NL Out-PL warp BLOCK" \
+  "$(jq -r '[.outbounds[].tag] | join(" ")' "$WORK/order-app/merged.json")"
+assert_eq "WARP rule moves above the inbound catch-all rules, after the BLOCK rule" \
+  "BLOCK warp Out-DE Out-NL" \
+  "$(jq -r '[.routing.rules[0:4][].outboundTag] | join(" ")' "$WORK/order-app/merged.json")"
+assert_eq "no duplicated warp outbound after re-apply" "1" \
+  "$(jq -r '[.outbounds[] | select(.tag=="warp")] | length' "$WORK/order-app/merged.json")"
+check "empty balancers array is removed" \
+  bash -c "! jq -e '.routing.balancers' '$WORK/order-app/merged.json' >/dev/null 2>&1"
+
+# ---------------------------------------------------------------------------
+printf '\n[8g] Panel API key auth (X-Api-Key, no /api/admin/token)\n'
+mkdir -p "$WORK/fakebin5"
+cat >"$WORK/fakebin5/curl" <<'EOF'
+#!/usr/bin/env bash
+url="${@: -1}"
+out=""; prev=""; has_key=0; method=""
+for a in "$@"; do
+  if [[ "$prev" == "-o" ]]; then out="$a"; fi
+  if [[ "$prev" == "-X" ]]; then method="$a"; fi
+  if [[ "$a" == X-Api-Key:* ]]; then has_key=1; fi
+  prev="$a"
+done
+if [[ "$has_key" != "1" ]]; then
+  printf '{"detail":"unauthorized"}' >"$out"; printf '401'; exit 0
+fi
+if [[ "$url" == */api/cores ]]; then
+  printf '{"count":1,"cores":[{"id":1,"name":"foreign","type":"xray"}]}' >"$out"
+  printf '200'; exit 0
+fi
+if [[ "$url" == */api/admin/token ]]; then
+  printf '{"detail":"should not be called"}' >"$out"; printf '500'; exit 0
+fi
+printf '{"detail":"not found"}' >"$out"; printf '404'; exit 0
+EOF
+chmod +x "$WORK/fakebin5/curl"
+cat >"$WORK/fakebin5/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1\n'; exit 0 ;;
+  inspect) printf '\n'; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin5/docker"
+check "--help documents --panel-key" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--panel-key KEY'"
+probe_out="$(WARP_APP_DIR="$WORK/key-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin5:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_API_KEY="pg_key_00000000-0000-4000-8000-000000000000"
+    if panel_probe_key "https://panel.example.com" 1; then printf "OK"; else printf "BAD:%s" "$PANEL_HTTP"; fi' 2>/dev/null || true)"
+assert_eq "panel_probe_key accepts a real /api/cores response" "OK" "$probe_out"
+login_key_out="$(WARP_APP_DIR="$WORK/key-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin5:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_API_KEY="pg_key_00000000-0000-4000-8000-000000000000"
+    PANEL_URL="https://panel.example.com" INSECURE=1
+    panel_login >/dev/null 2>&1
+    printf "%s|%s" "$PANEL_AUTH_MODE" "$PANEL_ACCESS_TOKEN"' 2>/dev/null || true)"
+assert_eq "panel_login switches to api-key mode without a token request" \
+  "api-key|pg_key_00000000-0000-4000-8000-000000000000" "$login_key_out"
+api_hdr_out="$(WARP_APP_DIR="$WORK/key-app3" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin5:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_AUTH_MODE="api-key"
+    PANEL_ACCESS_TOKEN="pg_key_00000000-0000-4000-8000-000000000000"
+    PANEL_URL="https://panel.example.com"
+    if panel_api GET /cores; then printf "%s" "$PANEL_API_BODY"; fi' 2>/dev/null || true)"
+check "panel_api sends X-Api-Key and reads /api/cores" \
+  bash -c '[[ "$1" == *"foreign"* ]]' _ "$api_hdr_out"
+cat >"$WORK/key-wizard.sh" <<'EOF'
+source "$WARP_MANAGER"
+DETECTED_IPS=("203.0.113.10"); DETECTED_IFACES=("eth0"); DETECTED_ROLE="node"
+ASSUME_YES=0; BINDING_PRESET=0
+choose_target >/dev/null 2>&1
+choose_mode >/dev/null 2>&1
+choose_binding >/dev/null 2>&1
+choose_routing >/dev/null 2>&1
+choose_optional >/dev/null 2>&1
+printf 'KEY=%s APPLY=%s URL=%s' "$PANEL_API_KEY" "$APPLY_PANEL" "$PANEL_URL"
+EOF
+key_wiz="$(printf '1\n1\n1\n1\n\n\n\npg_key_test\n\n\n' \
+  | WARP_APP_DIR="$WORK/key-app4" WARP_MANAGER="$ROOT/warp-manager.sh" \
+    bash "$WORK/key-wizard.sh" 2>/dev/null || true)"
+check "install wizard asks for and stores the API key" \
+  bash -c '[[ "$1" == *"KEY=pg_key_test"* && "$1" == *"APPLY=yes"* ]]' _ "$key_wiz"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
