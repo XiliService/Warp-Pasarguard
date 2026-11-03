@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.4"
+readonly SCRIPT_VERSION="1.0.5"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -101,6 +101,8 @@ WGCF_ARCH="amd64"; DETECTED_ROLE="unknown"
 PRIMARY_IP=""; DEFAULT_ROUTE=""; DEFAULT_GW=""; DEFAULT_DEV=""
 XRAY_VERSION="unknown"; COMPOSE_SERVICES=""
 COMPOSE_CONTAINER=""; COMPOSE_SERVICE_HINT=""; PANEL_APPLY_OK=0
+PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
+ALLOW_LOCAL_PANEL="0"
 ROUTE_GUARD=0
 ROUTE_BEFORE=""
 COMPOSE_FILE=""
@@ -1024,7 +1026,8 @@ patch_compose() {
   fi
 
   info "Patching ${COMPOSE_FILE} (service: ${selected}) with /dev/net/tun permissions."
-  local backup
+  local backup before_hash after_hash
+  before_hash="$(sha256sum "$COMPOSE_FILE" 2>/dev/null | awk '{print $1}')"
   backup="$(backup_file "$COMPOSE_FILE")"
   [[ -n "$backup" ]] && info "Backup saved: ${backup}"
 
@@ -1122,6 +1125,11 @@ PY
   state_set COMPOSE_FILE "$COMPOSE_FILE"
   state_set COMPOSE_SERVICE "$selected"
   state_set COMPOSE_BACKUP "$backup"
+  after_hash="$(sha256sum "$COMPOSE_FILE" 2>/dev/null | awk '{print $1}')"
+  if [[ -n "$before_hash" && "$before_hash" == "$after_hash" ]]; then
+    ok "Compose file already has TUN permissions (no change, no restart)."
+    return 0
+  fi
   ok "Compose file patched."
 
   if have docker && [[ "$DRY_RUN" != "1" ]]; then
@@ -1158,40 +1166,119 @@ panel_endpoint() {
   printf '%s' "${PANEL_URL%/}/api"
 }
 
+# Panel containers running on THIS host can be reached directly, which helps
+# when the public dashboard domain does not resolve (or is firewalled) from
+# the VPS itself. Read-only discovery; nothing is changed here.
+local_panel_urls() {
+  local name image ports port ip cport
+  have docker || return 0
+  have jq || return 0
+  while IFS= read -r name; do
+    [[ -n "$name" ]] || continue
+    image="$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || true)"
+    [[ "$image" == *pasarguard/panel* ]] || continue
+    ports="$(docker inspect "$name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null || true)"
+    [[ -n "$ports" && "$ports" != "null" && "$ports" != "{}" ]] || continue
+    while IFS= read -r port; do
+      if [[ "$port" =~ ^[0-9]+$ ]]; then printf 'http://127.0.0.1:%s\n' "$port"; fi
+    done < <(jq -r 'to_entries[] | .value[]? | .HostPort // empty' <<<"$ports" 2>/dev/null)
+    ip="$(docker inspect "$name" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null || true)"
+    ip="${ip%% *}"
+    if [[ -n "$ip" && "$ip" != "<no value>" ]]; then
+      while IFS= read -r port; do
+        cport="${port%%/*}"
+        if [[ "$cport" =~ ^[0-9]+$ ]]; then printf 'http://%s:%s\n' "$ip" "$cport"; fi
+      done < <(jq -r 'to_entries[] | .key' <<<"$ports" 2>/dev/null)
+    fi
+  done < <(docker ps --format '{{.Names}}' 2>/dev/null || true)
+  return 0
+}
+
+# Single login attempt. Sets PANEL_ACCESS_TOKEN on success, otherwise records
+# the exact reason in PANEL_NETERR (curl error) or PANEL_HTTP/PANEL_BODY.
+panel_try_login() {
+  local base="$1" k="$2" tmp err code body
+  tmp="$(mktemp)"; err="$(mktemp)"
+  local -a opts=(-sS -X POST --connect-timeout 8 --max-time 25 \
+                 -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
+  if [[ "$k" == "1" ]]; then opts+=(-k); fi
+  PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
+  code="$(curl "${opts[@]}" --data-urlencode "username=${PANEL_USER}" \
+        --data-urlencode "password=${PANEL_PASS}" \
+        "${base%/}/api/admin/token" 2>"$err")" || {
+    PANEL_NETERR="$(tr '\n' ' ' < "$err" | cut -c1-240)"
+    rm -f -- "$tmp" "$err"
+    return 1
+  }
+  rm -f -- "$err"
+  body="$(cat "$tmp")"; rm -f -- "$tmp"
+  PANEL_ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)"
+  if [[ -z "$PANEL_ACCESS_TOKEN" ]]; then
+    PANEL_HTTP="$code"; PANEL_BODY="$(printf '%s' "$body" | head -c 240)"
+    return 1
+  fi
+  return 0
+}
+
 panel_login() {
   if [[ -n "$PANEL_TOKEN" ]]; then
     PANEL_ACCESS_TOKEN="$PANEL_TOKEN"
     return 0
   fi
-  [[ -n "$PANEL_URL" ]] || return 1
+  [[ -n "$PANEL_URL" ]] || { error "Panel URL is required."; return 1; }
   if [[ -z "$PANEL_USER" ]]; then
     PANEL_USER="$(ui_read "Panel admin username: ")" || return 1
   fi
   if [[ -z "$PANEL_PASS" ]]; then
     PANEL_PASS="$(ui_read_secret "Panel admin password: ")" || return 1
   fi
-  local code body tmp
-  tmp="$(mktemp)"
-  local -a opts=(-sS -X POST --connect-timeout 10 --max-time 30 \
-                 -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
-  [[ "$INSECURE" == "1" ]] && opts+=(-k)
-  code="$(curl "${opts[@]}" --data-urlencode "username=${PANEL_USER}" \
-        --data-urlencode "password=${PANEL_PASS}" \
-        "$(panel_endpoint)/admin/token" 2>/dev/null)" || {
-    rm -f -- "$tmp"
-    error "Could not reach the panel API at $(panel_endpoint)/admin/token"
-    return 1
-  }
-  body="$(cat "$tmp")"; rm -f -- "$tmp"
-  PANEL_ACCESS_TOKEN="$(jq -r '.access_token // empty' <<<"$body" 2>/dev/null || true)"
-  if [[ -z "$PANEL_ACCESS_TOKEN" ]]; then
-    error "Panel authentication failed (HTTP ${code})."
-    printf '  Response: %.200s\n' "$body" >&2
-    warn "Check the admin username/password. PANEL_URL must be the dashboard root (no /api suffix)."
-    warn "Manual check: curl -i -X POST --data-urlencode 'username=USER' --data-urlencode 'password=PASS' $(panel_endpoint)/admin/token"
-    return 1
+
+  local configured="$PANEL_URL" b url pass k configured_err=""
+  local -a urls=("$configured") passes=(1)
+  [[ "$INSECURE" == "1" ]] || passes+=(2)
+  while IFS= read -r b; do
+    [[ -n "$b" ]] || continue
+    [[ " ${urls[*]} " == *" ${b} "* ]] || urls+=("$b")
+  done < <(local_panel_urls)
+
+  for pass in "${passes[@]}"; do
+    if [[ "$pass" == "2" ]]; then
+      warn "Retrying with TLS certificate verification disabled (add --insecure to skip this)."
+    fi
+    for url in "${urls[@]}"; do
+      k=0; [[ "$pass" == "2" || "$INSECURE" == "1" ]] && k=1
+      if [[ "$url" != "$configured" ]]; then
+        if [[ "$ALLOW_LOCAL_PANEL" != "1" ]]; then
+          info "Skipping local panel ${url} (pass --allow-local-panel to use it)."
+          continue
+        fi
+        warn "Using the LOCAL panel at ${url} because ${configured} is unreachable."
+        warn "Make sure this is the panel that manages your users."
+      fi
+      if panel_try_login "$url" "$k"; then
+        PANEL_URL="$url"; INSECURE="$k"
+        ok "Authenticated with the panel API at ${url}"
+        if [[ "$k" == "1" ]]; then warn "TLS verification is disabled for this session."; fi
+        return 0
+      fi
+      if [[ "$url" == "$configured" && -z "$configured_err" ]]; then
+        if [[ -n "$PANEL_NETERR" ]]; then configured_err="network: ${PANEL_NETERR}"
+        else configured_err="HTTP ${PANEL_HTTP}: ${PANEL_BODY}"; fi
+      fi
+    done
+  done
+
+  error "Panel login failed."
+  error "  ${configured} -> ${configured_err:-unknown error}"
+  local u
+  for u in "${urls[@]}"; do info "  Tried endpoint: ${u}"; done
+  if (( ${#urls[@]} > 1 )); then
+    warn "A panel is running locally. If THAT is the panel with your users,"
+    warn "re-run with --allow-local-panel, or paste the snippets manually."
+  else
+    warn "Check DNS/TLS/firewall from this VPS. Admin user needs cores:read+update."
   fi
-  ok "Authenticated with the panel API."
+  return 1
 }
 
 panel_api() {
@@ -2137,6 +2224,8 @@ Other options:
   --dry-run                 Print the plan and exit without changes
   --force                   Allow reinstall / forced update
   --insecure                Skip TLS verification (downloads and panel API)
+  --allow-local-panel    Permit using a panel container on this host when
+                         the configured panel URL is unreachable
   --branch BRANCH           Git branch used by 'update'
   --url URL                 Direct script URL used by 'update'
   --check                   With 'update': only check for a new version
@@ -2190,6 +2279,7 @@ parse_args() {
       --dry-run) DRY_RUN=1; shift ;;
       --force) FORCE=1; shift ;;
       --insecure) INSECURE=1; shift ;;
+      --allow-local-panel) ALLOW_LOCAL_PANEL=1; shift ;;
       --branch) REPO_BRANCH="$2"; shift 2 ;;
       --url) UPDATE_URL="$2"; shift 2 ;;
       --check) UPDATE_CHECK_ONLY=1; shift ;;

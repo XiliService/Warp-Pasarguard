@@ -452,6 +452,85 @@ check "out-node compose file was patched" \
   grep -q '/dev/net/tun:/dev/net/tun' "$WORK/nodeA/docker-compose.yml"
 check "main-node compose file was patched too" \
   grep -q '/dev/net/tun:/dev/net/tun' "$WORK/nodeB/docker-compose.yml"
+second_patch="$(WARP_APP_DIR="$WORK/multinode-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin3:$PATH" ASSUME_YES=1 bash -c '
+    source "$WARP_MANAGER"
+    COMPOSE_FILE="'"$WORK"'/nodeA/docker-compose.yml"
+    COMPOSE_SERVICE_HINT="node"; COMPOSE_CONTAINER="out-node"
+    patch_compose 2>&1' || true)"
+check "re-running the compose patch does not restart containers" \
+  bash -c '[[ "$1" == *"no change, no restart"* ]]' _ "$second_patch"
+
+# ---------------------------------------------------------------------------
+printf '\n[8d] Panel API reachability diagnostics and local fallback\n'
+mkdir -p "$WORK/fakebin4"
+cat >"$WORK/fakebin4/curl" <<'EOF'
+#!/usr/bin/env bash
+url="${@: -1}"
+out=""; prev=""
+for a in "$@"; do
+  if [[ "$prev" == "-o" ]]; then out="$a"; fi
+  prev="$a"
+done
+if [[ "$url" == *127.0.0.1* ]]; then
+  printf '{"access_token":"LOCALTOKEN"}' >"$out"
+  printf '200'
+  exit 0
+fi
+echo "curl: (6) Could not resolve host: panel.example.com" >&2
+exit 6
+EOF
+chmod +x "$WORK/fakebin4/curl"
+cat >"$WORK/fakebin4/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1\n'; exit 0 ;;
+  inspect)
+    fmt="$4"
+    case "$fmt" in
+      *Config.Image*) printf 'pasarguard/panel:latest\n' ;;
+      *NetworkSettings.Ports*) printf '{"8000/tcp":[{"HostIp":"0.0.0.0","HostPort":"8000"}]}\n' ;;
+      *NetworkSettings.Networks*) printf '172.18.0.5 \n' ;;
+      *) printf '\n' ;;
+    esac
+    exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin4/docker"
+check "--help documents --allow-local-panel" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--allow-local-panel'"
+neterr="$(WARP_APP_DIR="$WORK/panel-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin4:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_USER=u PANEL_PASS=p
+    panel_try_login "https://panel.example.com" 0 || true
+    printf "%s" "$PANEL_NETERR"' 2>/dev/null || true)"
+check "panel_try_login surfaces the real curl network error" \
+  bash -c '[[ "$1" == *"Could not resolve host"* ]]' _ "$neterr"
+local_urls="$(WARP_APP_DIR="$WORK/panel-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin4:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    local_panel_urls' 2>/dev/null || true)"
+check "local_panel_urls discovers the local panel port" \
+  bash -c '[[ "$1" == *"http://127.0.0.1:8000"* ]]' _ "$local_urls"
+login_out="$(WARP_APP_DIR="$WORK/panel-app3" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin4:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_URL="https://panel.example.com" PANEL_USER=u PANEL_PASS=p
+    ALLOW_LOCAL_PANEL=1 INSECURE=1
+    panel_login 2>&1
+    printf "URL=%s TOKEN=%s\n" "$PANEL_URL" "$PANEL_ACCESS_TOKEN"' 2>/dev/null || true)"
+check "panel_login falls back to the local panel when allowed" \
+  bash -c '[[ "$1" == *"URL=http://127.0.0.1:8000 TOKEN=LOCALTOKEN"* ]]' _ "$login_out"
+login_out2="$(WARP_APP_DIR="$WORK/panel-app4" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin4:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_URL="https://panel.example.com" PANEL_USER=u PANEL_PASS=p
+    INSECURE=1
+    panel_login 2>&1 || true' 2>/dev/null || true)"
+check "panel_login does NOT switch panels without the flag" \
+  bash -c '[[ "$1" == *"Skipping local panel"* && "$1" == *"Panel login failed"* ]]' _ "$login_out2"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'

@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.4
+  PasarGuard WARP Manager  v1.0.5
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -199,6 +199,13 @@ sudo warp-manager unapply --panel-url https://panel.example.com \
 Core Settings (useful when the API login failed during the first install).
 `unapply` removes them. `warp-manager fix-compose --yes` only re-runs the TUN
 part without touching the panel.
+
+If the dashboard domain is not reachable from the VPS itself, use
+`--insecure` (skips TLS verification) and check the printed curl error
+(DNS / TLS / firewall). A panel container running on the same host can be
+used explicitly with `--allow-local-panel`; the manager also discovers its
+ports and prints them. Re-running `apply` never restarts node containers that
+are already patched.
 
 ---
 

@@ -138,3 +138,24 @@ sudo tcpdump -ni any 'udp port 2408' -nn
 sudo warp-manager install --force      # re-register accounts and regenerate JSON
 sudo warp-manager remove               # clean uninstall
 ```
+
+---
+
+## Panel API is unreachable from the VPS
+
+`apply` now prints the exact curl error instead of a generic message, e.g.
+`curl: (6) Could not resolve host` (DNS), `SSL certificate problem` (TLS) or
+`Connection timed out` (firewall).
+
+```bash
+sudo warp-manager apply --panel-url https://panel.example.com \
+  --panel-user admin --panel-pass 'PASSWORD' --yes --insecure
+```
+
+* `--insecure` disables TLS verification for self-signed certificates.
+* If a `pasarguard/panel` container runs on the same host, `apply` lists its
+  local endpoints. Add `--allow-local-panel` **only if that panel is the one
+  that manages your users**.
+* If the real panel is on another server that this VPS cannot reach, paste
+  the generated `outbounds.json` and `routing-rules.json` into Core Settings
+  from your browser instead.
