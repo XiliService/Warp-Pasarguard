@@ -286,13 +286,23 @@ sudo warp-manager status
 Look for:
 
 ```
-  Installation     active (xray / exit)
+  Xray version     26.10.21 (minimum 1.8.3)
   TUN device       available
-  Profiles         default            (or nl de pl)
+  Installed         yes
+  Backend           xray
+  Target            exit
+  Binding           single
+  Routing           domains
+  Profiles          default            (or nl de pl)
+  Last panel apply  never
 OK    /opt/pasarguard-warp/outbound/outbounds.json
 OK    Docker compose patched: /opt/pg-node/docker-compose.yml
 OK Overall health: OK
 ```
+
+`Last panel apply  never` means the snippets were generated but **not pushed to
+the panel** - WARP is not yet carrying traffic. `Overall health: OK` only
+checks local files, so it is NOT proof that WARP is active.
 
 ### 9.2 Logs (menu option 4)
 
@@ -318,23 +328,31 @@ sudo tcpdump -ni any 'udp port 2408' -nn    # Ctrl+C to stop; shows WARP packets
 
 1. On your phone/PC, connect with one of the **`tunnel`** configs from the
    panel (v2rayNG, NekoRay, Streisand, ...).
-2. Open <https://www.cloudflare.com/cdn-cgi/trace> in the browser.
-3. Look for:
+2. Open <https://ipinfo.io/json> in the browser. `ip` should be a **Cloudflare**
+   address (`104.28.x.x`, `172.66.x.x`, `162.158.x.x`, ...) and `org` should
+   mention Cloudflare - **not** your foreign server IP.
+3. Also try the services that previously blocked your IP: Google, OpenAI,
+   Spotify, and <https://ipinfo.io/>.
+
+**If `routing=all` was chosen**, <https://www.cloudflare.com/cdn-cgi/trace>
+will additionally show:
 
 ```
 warp=on          (or warp=plus with a WARP+ key)
-ip=...           a Cloudflare address, not your server IP
+ip=...           a Cloudflare address
 loc=...          a Cloudflare PoP
 ```
 
-4. Also try <https://ipinfo.io/json> and one of the services that previously
-   blocked your IP (Google, OpenAI, Spotify).
+**If `routing=domains` was chosen**, `www.cloudflare.com` is NOT in the
+default domain list, so that page will show `warp=off`. That is correct, not
+a failure. To see `warp=on` there, add `cloudflare.com` to the rule's
+`domain` array (or temporarily use `routing=all`).
 
 ### 9.5 Negative control (important)
 
-Repeat 9.4 with a **`direct`** config. It should **not** show `warp=on`.
-That is expected and confirms WARP is scoped to the exit node, exactly as
-designed for your topology.
+Repeat 9.4 with a **`direct`** config. <https://ipinfo.io/json> must show your
+real foreign server IP again. That confirms the difference really comes from
+WARP and not from something else.
 
 ---
 

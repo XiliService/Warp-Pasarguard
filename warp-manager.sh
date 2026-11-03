@@ -1946,8 +1946,14 @@ cmd_status() {
       fi
     fi
   else
-    info "  Xray backend: test from a client config (e.g. https://www.cloudflare.com/cdn-cgi/trace)."
-    info "  Expected result: warp=on (or warp=plus) and a Cloudflare egress IP."
+    info "  Xray backend: traffic must be tested from a CLIENT config, not this server."
+    if [[ "$routing" == "all" ]]; then
+      info "  routing=all: https://www.cloudflare.com/cdn-cgi/trace -> warp=on."
+    else
+      info "  routing=domains: only the listed domains use WARP."
+      info "  Test with a listed domain (e.g. https://ipinfo.io) -> Cloudflare egress IP."
+      info "  www.cloudflare.com is NOT listed, so it will show warp=off (expected)."
+    fi
   fi
   line
 
