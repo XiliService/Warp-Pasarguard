@@ -73,7 +73,7 @@ does not complete a handshake). Putting a `wireguard` outbound in the Iran
 Core makes exactly the tunnel configs hang; putting a global WARP rule in the
 foreign Core affects every config.
 
-## 3.1 Dedicated WARP link (1.0.15, final design)
+## 3.1 Dedicated WARP link (1.0.17)
 
 A private SOCKS link joins the two Core configs, so WARP is used by the tunnel
 configs only:
@@ -94,12 +94,21 @@ configs only:
 * `warp-manager warp-link` on the **foreign** server creates the SOCKS inbound,
   the userspace WARP outbound, and a rule scoped to that inbound. It prints one
   `WARPLINK1:` line with host/port/user/pass.
-* `warp-manager warp-join 'WARPLINK1:...'` on the **Iran** server adds the
-  matching SOCKS outbound and *splits* the tunnel inbound tags out of the
-  existing location rules, so only those three use WARP. It also removes any
-  leftover local `warp` outbound/rule.
-* `cdn` / `direct` configs keep the three foreign IPs. No other config, node
-  or inbound is touched.
+* `warp-manager warp-inbound 'WARPLINK1:...'` on the **Iran** server creates ONE
+  brand-new `WARP-DEDICATED` SOCKS5 inbound and routes only that inbound to the
+  foreign link. No existing inbound, outbound or routing rule is modified.
+* `cdn` / `direct` / `tunnel` configs therefore keep their original rules and
+  the three foreign IPs. No other config, node or inbound is touched.
+
+### 3.2 Why the 1.0.15/1.0.16 "split tunnel rules" approach was wrong
+
+`warp-join` (1.0.15/1.0.16) removed the tunnel inbound tags from the existing
+`Germany` / `NetherLands` / `Poland` location rules and put them into a new
+WARP-LINK rule. That **changed the tunnel configs themselves**, which was
+exactly what the user did not want, and made them stop working. From 1.0.17
+`warp-join` is only an alias for `warp-inbound`; `warp-inbound` restores the
+original rules from the pre-join Core backup before adding the dedicated
+inbound. `warp-unlink` restores that same backup to undo everything.
 
 `warp-manager apply` still refuses a shared egress Core with no tunnel inbound
 unless `--all-traffic` is given.

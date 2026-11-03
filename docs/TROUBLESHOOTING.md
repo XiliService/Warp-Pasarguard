@@ -382,9 +382,40 @@ sudo warp-manager warp-link --yes
 
 # IRAN / MAIN PANEL server
 sudo warp-manager update --yes
-sudo warp-manager warp-join 'WARPLINK1:...' --yes
+sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
 ```
 
 If several Core configs exist and the selector cannot find one with (or
 without) tunnel inbounds, it now stops with an explicit message instead of
 picking the wrong one; pass `--core-id <number>` in that case.
+
+---
+
+## Tunnel configs break and I do not want ANY existing config to use WARP
+
+`warp-join` in 1.0.15/1.0.16 rewrote the existing location rules (it removed
+the `... Tunnel - ArvanCloud` tags from the `Germany` / `NetherLands` /
+`Poland` rules). Any change to those rules breaks the tunnel configs, so this
+approach is abandoned. Do not use `apply` on the Iran server either: a local
+WARP WireGuard outbound there cannot reach Cloudflare and hangs the tunnel
+configs.
+
+From 1.0.17 the script creates a **separate new inbound** instead. All 12
+existing inbounds and their routing rules are restored from the pre-join Core
+backup and left untouched; only the new `WARP-DEDICATED` inbound uses WARP via
+the foreign node:
+
+```bash
+# FOREIGN server
+sudo warp-manager update --yes
+sudo warp-manager warp-link --show       # prints the saved WARPLINK1: line
+
+# IRAN / MAIN PANEL server
+sudo warp-manager update --yes
+sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
+sudo warp-manager status
+```
+
+The command prints the SOCKS5 host/port/user/password for the new inbound and
+runs a live Cloudflare check through the foreign link. Allow the printed TCP
+port on the Iran firewall. To undo, run `sudo warp-manager warp-unlink --yes`.

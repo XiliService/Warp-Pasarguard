@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.16
+  PasarGuard WARP Manager  v1.0.17
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -781,18 +781,59 @@ sudo warp-manager warp-link          # prints ONE WARPLINK1: line
 
 # IRAN / MAIN PANEL server:
 sudo warp-manager update --yes
-sudo warp-manager warp-join 'WARPLINK1:...'
+sudo warp-manager warp-inbound 'WARPLINK1:...'
 ```
 
 `warp-link` adds a private SOCKS inbound `WARP-LINK`, the userspace WARP
 outbound (before `BLOCK`), and a routing rule scoped to that inbound only.
-`warp-join` adds the matching SOCKS outbound (before `BLOCK`) and splits the
-`... Tunnel - ArvanCloud` tags out of the existing location rules, so only
-those configs use WARP. `cdn` / `direct` keep `Germany` / `NetherLands` /
-`Poland` and the three foreign IPs.
+The 1.0.15 `warp-join` split the `... Tunnel - ArvanCloud` tags out of the
+existing location rules. That changed the tunnel configs and broke them, so
+**it must not be used**. From 1.0.17 the command is an alias for `warp-inbound`,
+which creates a brand-new inbound instead (see the next section).
 
 Both commands take a Core backup first, are idempotent, and refuse to guess if
 several Core configs exist without a tunnel/relay match. The `WARPLINK1:` line
 contains the link password: keep it private.
 
 `status` no longer reports "Account file missing" for an imported WARP profile.
+
+---
+
+## One dedicated WARP inbound, all existing configs untouched (1.0.17)
+
+If **no** existing config (`cdn`, `direct` or `tunnel`) should use WARP, create
+a brand-new inbound on the **Iran main panel** server. Only that new inbound
+is routed to the foreign WARP link; every existing inbound, outbound and
+routing rule is left exactly as it was.
+
+```bash
+# FOREIGN server: print the saved link again (changes nothing)
+sudo warp-manager update --yes
+sudo warp-manager warp-link --show
+
+# IRAN / MAIN PANEL server: create the dedicated WARP inbound
+sudo warp-manager update --yes
+sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
+sudo warp-manager status
+```
+
+`warp-inbound` also restores the original routing rules from the most recent
+`warp-join-core-*.json` backup, undoing the rule splitting done by 1.0.16. It
+then adds:
+
+* a new `WARP-DEDICATED` SOCKS5 inbound (random TCP port, user + password);
+* a `WARP-LINK` SOCKS outbound to the foreign relay, inserted before `BLOCK`;
+* exactly one routing rule, `inboundTag: ["WARP-DEDICATED"] -> WARP-LINK`,
+  placed below the leading `BLOCK` rule and above the location rules.
+
+It prints the host, port, username, password and a copy-pasteable `curl` test.
+Give those SOCKS5 details only to the users who need WARP, and allow that TCP
+port on the Iran host firewall. Before applying it also runs a live
+`socks5h://` test from Iran through the foreign link and reports the Cloudflare
+IP, so the WARP path is verified rather than assumed.
+
+To remove everything again and restore the original Core config:
+
+```bash
+sudo warp-manager warp-unlink --yes
+```
