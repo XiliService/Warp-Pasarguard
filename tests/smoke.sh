@@ -157,6 +157,22 @@ check "kernel config contains PersistentKeepalive" grep -q '^PersistentKeepalive
 check "kernel config omits DNS to protect resolv.conf" bash -c "! grep -q '^DNS =' '$WORK/warp-nl.conf'"
 
 # ---------------------------------------------------------------------------
+printf '\n[6a] Binding wizard option 2 asks for a source IP\n'
+cat >"$WORK/binding.sh" <<'EOF'
+source "$WARP_MANAGER"
+DETECTED_IPS=("203.0.113.10" "203.0.113.11")
+DETECTED_IFACES=("eth0" "eth0")
+ASSUME_YES=0
+BINDING_PRESET=0
+BINDING="single"
+choose_binding >/dev/null 2>&1
+printf '%s|%s' "$BINDING" "$SRC_IP"
+EOF
+binding_out="$(printf '2\n1\n' | WARP_APP_DIR="$WORK/binding-app" \
+  WARP_MANAGER="$ROOT/warp-manager.sh" bash "$WORK/binding.sh" 2>/dev/null || true)"
+assert_eq "option 2 records the chosen source IP" "single|203.0.113.10" "$binding_out"
+
+# ---------------------------------------------------------------------------
 printf '\n[6b] Full profile creation with a mocked wgcf binary\n'
 mkdir -p "$BIN_DIR"
 cat >"$WGCF_BIN" <<'MOCK'

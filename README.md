@@ -466,6 +466,7 @@ integration was not used.
 | Panel API returns 404 | The docs/API may be disabled or the URL needs the dashboard prefix; use `--no-apply-panel` and paste manually |
 | Only `tunnel` configs work | Expected: WARP on the foreign node covers only traffic that exits there. `direct`/`cdn` configs need their own deployment |
 
-See also [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
+See also [`docs/STEP-BY-STEP.md`](docs/STEP-BY-STEP.md) (complete beginner
+walkthrough), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/PANEL-CONFIG.md`](docs/PANEL-CONFIG.md) and
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).

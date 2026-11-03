@@ -1268,7 +1268,7 @@ TXT
 
 choose_binding() {
   local -a opts=()
-  local i ans c
+  local i ans c ask_src=0
   header "Source IP / location binding"
   printf '  Detected %d global IPv4 address(es) on this host.\n' "${#DETECTED_IPS[@]}"
   cat <<'TXT'
@@ -1287,7 +1287,7 @@ TXT
         "Per-IP WARP accounts - one tunnel per detected IP (advanced)")" || return 1
     case "$c" in
       1) BINDING="single"; SRC_IP="" ;;
-      2) BINDING="single" ;;
+      2) BINDING="single"; ask_src=1 ;;
       3) BINDING="per-ip" ;;
     esac
   fi
@@ -1314,7 +1314,7 @@ TXT
     is_valid_ipv4 "$SRC_IP" || die "Invalid source IPv4 address: ${SRC_IP}"
     return 0
   fi
-  if [[ "$ASSUME_YES" == "1" || -z "${WARP_SRC_IP:-}" ]]; then
+  if [[ "$ask_src" == "0" && ( "$ASSUME_YES" == "1" || -z "${WARP_SRC_IP:-}" ) ]]; then
     SRC_IP=""
     return 0
   fi
