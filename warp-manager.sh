@@ -16,11 +16,11 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.15"
+readonly SCRIPT_VERSION="1.0.16"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
-readonly REPO_BRANCH_DEFAULT="main"
-readonly REPO_BRANCH_FALLBACK="arena/01417195-warp-pasarguard"
+readonly REPO_BRANCH_DEFAULT="arena/01417195-warp-pasarguard"
+readonly REPO_BRANCH_FALLBACK="main"
 readonly WGCF_REPO="ViRb3/wgcf"
 readonly WGCF_VERSION_DEFAULT="v2.2.22"
 readonly MIN_XRAY_VERSION="1.8.3"
@@ -2702,8 +2702,10 @@ panel_put_core() {
   return 0
 }
 
+PANEL_SELECTED_CORE_ID=""
 panel_authed_core() {
   local want_tunnel="$1" cid best=""
+  PANEL_SELECTED_CORE_ID=""
   panel_login || return 1
   panel_api GET "/cores" || return 1
   local -a ids=()
@@ -2729,16 +2731,22 @@ panel_authed_core() {
     fi
     return 1
   fi
-  printf '%s' "$best"
+  PANEL_SELECTED_CORE_ID="$best"
   return 0
 }
 
 resolve_link_core() {
   local want="$1"
+  PANEL_SELECTED_CORE_ID=""
   if [[ -n "${PANEL_CORE_ID:-}" ]]; then
-    printf '%s' "$PANEL_CORE_ID"; return 0
+    PANEL_SELECTED_CORE_ID="$PANEL_CORE_ID"; return 0
   fi
   panel_authed_core "$want"
+}
+
+require_clean_core_id() {
+  local cid="${1:-}"
+  [[ "$cid" =~ ^[0-9]+$ ]] || die "Invalid Core config ID '${cid}'. Use --core-id <number>."
 }
 
 cmd_warp_link() {
@@ -2752,7 +2760,9 @@ cmd_warp_link() {
   build_snippets "${profiles[@]}" >/dev/null || die "Could not build the WARP outbound."
   header "$APP_NAME v$SCRIPT_VERSION - Create dedicated WARP link (FOREIGN server)"
   [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
-  local core_id; core_id="$(resolve_link_core 0)" || die "Could not choose the foreign relay Core config."
+  resolve_link_core 0 || die "Could not choose the foreign relay Core config."
+  local core_id="$PANEL_SELECTED_CORE_ID"
+  require_clean_core_id "$core_id"
   info "Using Core config ${core_id} on this egress relay."
   panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
   local snapshot="$BACKUP_DIR/warp-link-core-${core_id}-$(now_tag).json"
@@ -2848,7 +2858,9 @@ cmd_warp_join() {
   fi
   ok "WARP link ${lh}:${lp} is reachable from this server."
   [[ -n "$PANEL_API_KEY" ]] || ensure_api_key || die "Could not create/verify the Panel API key."
-  local core_id; core_id="$(resolve_link_core 1)" || die "Could not choose the Iran main Core config."
+  resolve_link_core 1 || die "Could not choose the Iran main Core config."
+  local core_id="$PANEL_SELECTED_CORE_ID"
+  require_clean_core_id "$core_id"
   info "Using Core config ${core_id} (it has the tunnel inbounds)."
   panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
   local snapshot="$BACKUP_DIR/warp-join-core-${core_id}-$(now_tag).json"
@@ -3313,7 +3325,15 @@ cmd_update() {
   fi
   for url in "${urls[@]}"; do
     info "Checking ${url}"
-    if fetch "$url" "$tmp" 2>/dev/null; then fetched=1; REPO_BRANCH="${REPO_BRANCH:-main}"; break; fi
+    if fetch "$url" "$tmp" 2>/dev/null; then
+      fetched=1
+      for b in "${branches[@]}"; do
+        if [[ "$url" == *"ref=${b}"* || "$url" == *"/${b}/warp-manager.sh"* || "$url" == *"/heads/${b}/warp-manager.sh"* ]]; then
+          REPO_BRANCH="$b"; break
+        fi
+      done
+      break
+    fi
   done
   if (( fetched == 0 )); then
     rm -f -- "$tmp"

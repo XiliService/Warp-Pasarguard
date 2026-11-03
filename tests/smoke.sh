@@ -1199,10 +1199,10 @@ check "warp-link leaves the location rules untouched" \
 check "warp-link WARP outbound is userspace" \
   bash -c "jq -e '.config.outbounds[] | select(.tag==\"warp\") | .settings.noKernelTun == true' '$link_put' >/dev/null"
 check "--core-id override is honoured by the link commands" \
-  bash -c "WARP_APP_DIR='$WORK/cid-app' PANEL_CORE_ID=7 WARP_MANAGER='$ROOT/warp-manager.sh' bash -c 'source \"\$WARP_MANAGER\" >/dev/null 2>&1 || true; PANEL_CORE_ID=7; resolve_link_core 1' | grep -qx 7"
+  bash -c "WARP_APP_DIR='$WORK/cid-app' PANEL_CORE_ID=7 WARP_MANAGER='$ROOT/warp-manager.sh' bash -c 'source \"\$WARP_MANAGER\" >/dev/null 2>&1 || true; PANEL_CORE_ID=7; resolve_link_core 1; [[ \"\$PANEL_SELECTED_CORE_ID\" == 7 ]]'"
 cat >"$WORK/mismatch-core.sh" <<'EOS'
-WARP_APP_DIR="$WORK/cid2-app"
-source "$ROOT/warp-manager.sh" >/dev/null 2>&1 || true
+WARP_APP_DIR="$1/cid2-app"
+source "$2/warp-manager.sh" >/dev/null 2>&1 || true
 panel_login() { return 0; }
 panel_api() {
   if [[ "$1" == GET && "$2" == /cores ]]; then
@@ -1212,12 +1212,87 @@ panel_api() {
   fi
   return 0
 }
-panel_authed_core 1 >/dev/null 2>&1
-[[ $? -ne 0 ]]
+PANEL_CORE_ID=""
+if panel_authed_core 1 >/dev/null 2>&1; then exit 1; fi
+exit 0
 EOS
 check "core auto-selection refuses to guess on a mismatched relay" \
-  bash "$WORK/mismatch-core.sh"
+  bash "$WORK/mismatch-core.sh" "$WORK" "$ROOT"
+cat >"$WORK/polluted-core.sh" <<'EOS'
+WARP_APP_DIR="$1/pollution-app"
+source "$2/warp-manager.sh" >/dev/null 2>&1 || true
+# Reproduce the real-host bug: panel_login/panel_api print progress to stdout
+panel_login() { info "Checking 21 candidate panel endpoint(s) with the API key."; ok "Panel API key accepted at https://127.0.0.1:443"; return 0; }
+panel_api() {
+  info "Checking 21 candidate panel endpoint(s) with the API key."
+  ok "Panel API key accepted at https://127.0.0.1:443"
+  if [[ "$1" == GET && "$2" == /cores ]]; then PANEL_API_BODY='{"cores":[{"id":1}]}'
+  else PANEL_API_BODY='{"config":{"inbounds":[{"tag":"Germany"}]}}'; fi
+  return 0
+}
+PANEL_CORE_ID=""
+resolve_link_core 0 || exit 1
+require_clean_core_id "$PANEL_SELECTED_CORE_ID" || exit 1
+[[ "$PANEL_SELECTED_CORE_ID" == 1 ]] || exit 1
+EOS
+check "progress logs no longer pollute the selected Core ID (regression)" \
+  bash "$WORK/polluted-core.sh" "$WORK" "$ROOT"
+check "cmd_warp_link does not capture Core selection in a subshell" \
+  bash -c "grep -q 'resolve_link_core 0 || die' '$ROOT/warp-manager.sh'"
+check "cmd_warp_join does not capture Core selection in a subshell" \
+  bash -c "grep -q 'resolve_link_core 1 || die' '$ROOT/warp-manager.sh'"
 
+# ---------------------------------------------------------------------------
+printf '\n[8q] Real-host regression: noisy panel logs + warp-link\n'
+cat >"$WORK/noisy-link.sh" <<'EOS'
+WORK_DIR="$1"
+APP_ROOT="$2"
+WARP_APP_DIR="$WORK_DIR/noisy-app"
+source "$APP_ROOT/warp-manager.sh" >/dev/null 2>&1 || true
+state_init
+state_set PANEL_API_KEY pg_key_test; state_set PANEL_URL "http://127.0.0.1:8000"
+state_set PROFILES default
+profile_meta_set default PRIVATE_KEY "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+profile_meta_set default ADDRESS4 "172.16.0.2/32"
+profile_meta_set default ADDRESS6 ""
+profile_meta_set default PUBLIC_KEY "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo="
+profile_meta_set default ENDPOINT "engage.cloudflareclient.com:2408"
+profile_meta_set default TAG "warp"
+PANEL_CORE_ID=""
+panel_login() {
+  info "Checking 21 candidate panel endpoint(s) with the API key."
+  ok "Panel API key accepted at https://127.0.0.1:443"
+  return 0
+}
+panel_api() {
+  info "Checking 21 candidate panel endpoint(s) with the API key."
+  ok "Panel API key accepted at https://127.0.0.1:443"
+  local m="$1" p="$2" b="${3:-}"
+  if [[ "$m" == GET && "$p" == "/cores" ]]; then
+    PANEL_API_BODY='{"count":1,"cores":[{"id":1,"name":"Kharej"}]}'; return 0
+  fi
+  if [[ "$m" == GET && "$p" == "/core/1" ]]; then
+    PANEL_API_BODY='{"id":1,"name":"Kharej","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],"config":{"inbounds":[{"tag":"Germany","protocol":"vless","port":64483}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK"}]}}}'
+    return 0
+  fi
+  if [[ "$m" == PUT ]]; then
+    printf '%s\n' "$p" > "$WORK_DIR/noisy-put-path.txt"
+    printf '%s' "$b" > "$WORK_DIR/noisy-put.json"
+    PANEL_API_BODY='{}'; return 0
+  fi
+  return 1
+}
+confirm() { return 0; }
+ensure_api_key() { return 0; }
+cmd_warp_link > "$WORK_DIR/noisy-link.out" 2>&1 || true
+EOS
+bash "$WORK/noisy-link.sh" "$WORK" "$ROOT" >/dev/null 2>&1 || true
+check "warp-link reaches /core/1 (not a log-polluted path)" \
+  bash -c "grep -qx '/core/1?restart_nodes=true' '$WORK/noisy-put-path.txt'"
+check "warp-link PUT is valid JSON with the WARP-LINK inbound" \
+  bash -c "jq -e '[.config.inbounds[].tag] | index(\"WARP-LINK\") != null' '$WORK/noisy-put.json' >/dev/null"
+check "warp-link prints exactly one WARPLINK1 line" \
+  bash -c "[[ \$(grep -c '^WARPLINK1:' '$WORK/noisy-link.out') -eq 1 ]]"
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "

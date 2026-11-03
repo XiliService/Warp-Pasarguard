@@ -361,3 +361,30 @@ sudo warp-manager status
 ```
 
 Both sides keep `BLOCK` as the trailing outbound and the leading routing rule.
+
+---
+
+## `warp-link` prints "Using Core config ==> Checking 21 candidate..." then "Could not read Core config"
+
+This was a 1.0.15 bug: the Core ID was captured with `$(...)`, and the panel
+progress lines written to stdout were captured together with the ID. The script
+then tried `GET /core/<progress text + 1>` and failed.
+
+From 1.0.16 the Core selection writes its result to a variable instead of
+capturing stdout, validates that the ID is numeric, honours `--core-id`, and the
+updater reports the branch that actually served the file. Do not remove or
+reinstall anything; just update and rerun the two commands:
+
+```bash
+# FOREIGN server
+sudo warp-manager update --yes
+sudo warp-manager warp-link --yes
+
+# IRAN / MAIN PANEL server
+sudo warp-manager update --yes
+sudo warp-manager warp-join 'WARPLINK1:...' --yes
+```
+
+If several Core configs exist and the selector cannot find one with (or
+without) tunnel inbounds, it now stops with an explicit message instead of
+picking the wrong one; pass `--core-id <number>` in that case.

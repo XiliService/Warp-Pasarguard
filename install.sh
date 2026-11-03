@@ -17,9 +17,9 @@ umask 022
 
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
-readonly BRANCH_DEFAULT="main"
-readonly BRANCH_FALLBACK="arena/01417195-warp-pasarguard"
-readonly VERSION="1.0.15"
+readonly BRANCH_DEFAULT="arena/01417195-warp-pasarguard"
+readonly BRANCH_FALLBACK="main"
+readonly VERSION="1.0.16"
 
 # When this file is streamed with `curl | bash -s`, BASH_SOURCE[0] is unset.
 # Keep a safe, empty default so `set -u` never aborts the installer.
@@ -52,7 +52,7 @@ Usage:
   ./install.sh [OPTIONS]
 
 Options:
-  --branch BRANCH     Git branch to download from (default: main)
+  --branch BRANCH     Git branch to download from (default: arena/01417195-warp-pasarguard)
   --local PATH        Install from a local warp-manager.sh file (offline)
   --url URL           Direct URL of warp-manager.sh
   --app-dir PATH      Installation directory (default: /opt/pasarguard-warp)

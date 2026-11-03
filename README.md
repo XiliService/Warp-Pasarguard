@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.15
+  PasarGuard WARP Manager  v1.0.16
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown

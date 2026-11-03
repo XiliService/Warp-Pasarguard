@@ -78,7 +78,7 @@ What the command means:
 Expected output:
 
 ```
-  PasarGuard WARP Manager - Bootstrap Installer v1.0.15
+  PasarGuard WARP Manager - Bootstrap Installer v1.0.16
 ==> Trying https://api.github.com/repos/.../contents/warp-manager.sh?ref=...
 ==> Installed: /opt/pasarguard-warp/warp-manager.sh
 ==> Command  : /usr/local/bin/warp-manager
@@ -92,7 +92,7 @@ Verify the installation:
 
 ```bash
 which warp-manager
-warp-manager --version          # PasarGuard WARP Manager 1.0.15
+warp-manager --version          # PasarGuard WARP Manager 1.0.16
 ls -l /usr/local/bin/warp-manager
 ```
 
