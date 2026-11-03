@@ -400,7 +400,7 @@ approach is abandoned. Do not use `apply` on the Iran server either: a local
 WARP WireGuard outbound there cannot reach Cloudflare and hangs the tunnel
 configs.
 
-From 1.0.17 the script creates a **separate new inbound** instead. All 12
+From 1.0.17 the script created a **separate new inbound**; from 1.0.18 that inbound is a normal proxy config.  All 12
 existing inbounds and their routing rules are restored from the pre-join Core
 backup and left untouched; only the new `WARP-DEDICATED` inbound uses WARP via
 the foreign node:
@@ -416,6 +416,38 @@ sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
 sudo warp-manager status
 ```
 
-The command prints the SOCKS5 host/port/user/password for the new inbound and
-runs a live Cloudflare check through the foreign link. Allow the printed TCP
-port on the Iran firewall. To undo, run `sudo warp-manager warp-unlink --yes`.
+The command prints the inbound tag, protocol, cloned source and TCP port, plus
+the exact Host fields. Create the Host in the Panel UI afterwards and allow
+that TCP port on the Iran firewall. It also runs a live Cloudflare check
+through the foreign link. To undo, run `sudo warp-manager warp-unlink --yes`.
+
+
+---
+
+## The dedicated inbound is SOCKS5; I cannot create a Host or use v2rayNG
+
+That was 1.0.17. A raw `socks` inbound in the Core config cannot be used as a
+PasarGuard Host and produces no usable v2rayNG / v2rayN config. PasarGuard
+validates `inbound_tag` against the inbounds parsed from the Core configs
+(`core_manager.get_inbounds()`), and builds subscription links from the
+inbound's protocol.
+
+From 1.0.18 `warp-inbound` **clones an existing VLESS/Reality inbound** (only
+the tag and port change, `streamSettings` is preserved). The new tag appears
+immediately in the Panel host form. Update both servers and rerun:
+
+```bash
+# FOREIGN server
+sudo warp-manager update --yes
+sudo warp-manager warp-link --show
+
+# IRAN / MAIN PANEL server
+sudo warp-manager update --yes
+sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
+sudo warp-manager status
+```
+
+Then: `Hosts -> Add Host -> Inbound tag: WARP-DEDICATED`, address = Iran IP,
+port = the port printed by the command, other fields at their defaults. The
+old SOCKS5 inbound is replaced automatically. All existing configs stay
+unchanged.

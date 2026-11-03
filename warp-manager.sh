@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.17"
+readonly SCRIPT_VERSION="1.0.18"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="arena/01417195-warp-pasarguard"
@@ -2933,21 +2933,28 @@ cmd_warp_inbound() {
   printf '%s\n' "$PANEL_API_BODY" | jq . >"$snapshot"; chmod 600 "$snapshot"
   info "Core backup saved: ${snapshot}"
 
-  # Base on the exact pre-warp-join snapshot when available: that restores
-  # every original location rule that earlier versions had split.
-  local base="$snapshot" prev
+  # Default to the LIVE Core config so any changes made in the Panel UI are
+  # kept. Only fall back to the pre-join backup when the live rules are still
+  # missing tunnel tags (the damage done by 1.0.15/1.0.16 warp-join).
+  local base="$snapshot" prev damaged
   prev="$(ls -1t "$BACKUP_DIR"/warp-join-core-*.json 2>/dev/null | head -n1 || true)"
-  if [[ -n "$prev" ]] && jq -e '.config.inbounds and .config.outbounds' "$prev" >/dev/null 2>&1; then
+  damaged="$(jq -r '
+     [ (.config.inbounds // [])[] | .tag // empty
+       | select(ascii_downcase | test("tunnel")) ] as $t
+     | [ (.config.routing.rules // [])[] | (.inboundTag // [])
+         | if type == "array" then .[] else . end ] as $used
+     | [ $t[] | select(. as $x | ($used | index($x)) == null) ] | length
+   ' "$snapshot" 2>/dev/null || echo 0)"
+  if [[ "${damaged:-0}" != "0" && -n "$prev" ]] \
+     && jq -e '.config.inbounds and .config.outbounds' "$prev" >/dev/null 2>&1; then
     base="$prev"
-    info "Restoring the original rules from ${prev}"
+    warn "Live rules are missing ${damaged} tunnel tag(s); restoring the original rules from ${prev}"
   else
-    info "Using the live Core config as the baseline (no pre-join backup found)."
+    info "Using the live Core config as the baseline (existing rules are intact)."
   fi
 
-  local inport inuser inpass tag="$WARP_DEDICATED_TAG" used
+  local inport tag="$WARP_DEDICATED_TAG" used
   inport="$(state_get WARP_IN_PORT "")"
-  inuser="$(state_get WARP_IN_USER "")"
-  inpass="$(state_get WARP_IN_PASS "")"
   used="$(jq -r --arg t "$tag" \
         '[ (.config.inbounds // [])[] | select((.tag // "") != $t) | .port // empty ] | join(",")' \
         "$base" 2>/dev/null || true)"
@@ -2955,12 +2962,28 @@ cmd_warp_inbound() {
     inport="$(( 20000 + RANDOM % 20000 ))"
     while [[ ",$used," == *",$inport,"* ]]; do inport="$(( 20000 + RANDOM % 20000 ))"; done
   fi
-  [[ -n "$inuser" ]] || inuser="warp$(printf '%04x' "$RANDOM")"
-  [[ -n "$inpass" ]] || inpass="$(head -c 18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 20)"
+
+  # Clone a REAL existing inbound (VLESS/Reality/etc.), not a SOCKS one: the
+  # Panel only offers inbounds from the Core config for host creation, and
+  # only a normal proxy inbound produces a v2rayNG / v2rayN client config.
+  local src_tag clone protocol
+  src_tag="$(jq -r --arg t "$tag" '
+     [ (.config.inbounds // [])[] | select((.tag // "") != $t)
+       | select(((.protocol // "") | ascii_downcase
+                 | test("^(vless|vmess|trojan|shadowsocks)$"))) ] as $c
+     | (([$c[] | select((.tag // "") | ascii_downcase | test("reality|dc"))] + $c)
+        | .[0].tag // empty)
+   ' "$base" 2>/dev/null || true)"
+  [[ -n "$src_tag" ]] || die "No VLESS/VMESS/Trojan/Shadowsocks inbound to clone on Core ${core_id}. Create one normal inbound in the Panel first."
+  clone="$(jq -c --arg t "$tag" --argjson p "$inport" --arg s "$src_tag" '
+     [ (.config.inbounds // [])[] | select(.tag == $s) ][0]
+     | .tag = $t | .port = $p
+   ' "$base")" || die "Could not clone inbound ${src_tag}."
+  protocol="$(jq -r .protocol <<<"$clone")"
+  info "Cloning inbound '${src_tag}' (${protocol}) as '${tag}' on TCP port ${inport}."
 
   local merged; merged="$(mktemp)"
-  if ! jq --argjson link "$link" --argjson inport "$inport" \
-       --arg inuser "$inuser" --arg inpass "$inpass" --arg tag "$tag" '
+  if ! jq --argjson link "$link" --argjson clone "$clone" --arg tag "$tag" '
      def is_block:
        (((.outboundTag // "") | ascii_downcase | test("block|blackhole"))
         or ((.protocol // "") | ascii_downcase | test("blackhole")));
@@ -2981,12 +3004,7 @@ cmd_warp_inbound() {
           settings: { servers: [{ address: $link.host, port: $link.port,
                                   users: [{ user: $link.user, pass: $link.pass }] }] }
         }] + $o[$cut:])
-     | .inbounds = (.inbounds + [{
-          tag: $tag, protocol: "socks", port: $inport, listen: "0.0.0.0",
-          settings: { auth: "password",
-                      accounts: [{ user: $inuser, pass: $inpass }],
-                      udp: false, ip: "0.0.0.0" }
-        }])
+     | .inbounds = (.inbounds + [$clone])
      | (.routing.rules) as $r
      | ([ range(0; ($r|length)) as $i | select((($r[$i] | is_block) | not)) | $i ]
         | min // ($r|length)) as $rcut
@@ -3006,19 +3024,21 @@ cmd_warp_inbound() {
   state_set_many "WARP_LINK_HOST=$lh" "WARP_LINK_PORT=$lp" \
     "WARP_LINK_USER=$lu" "WARP_LINK_PASS=$ls" "WARP_LINK_TAG=$lt" \
     "WARP_LINK_CORE=$core_id" "WARP_IN_TAG=$tag" "WARP_IN_PORT=$inport" \
-    "WARP_IN_USER=$inuser" "WARP_IN_PASS=$inpass" \
+    "WARP_IN_SOURCE=$src_tag" "WARP_IN_PROTOCOL=$protocol" \
     "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
   local myip; myip="$(warp_primary_ip)"
   header "New dedicated WARP inbound (only this config uses WARP)"
-  printf '  %-16s %s\n' "Host" "${myip:-THIS-SERVER-IP}"
+  printf '  %-16s %s\n' "Inbound tag" "$tag"
+  printf '  %-16s %s\n' "Protocol" "$protocol"
+  printf '  %-16s %s\n' "Cloned from" "$src_tag"
   printf '  %-16s %s\n' "Port (TCP)" "$inport"
-  printf '  %-16s %s\n' "Protocol" "SOCKS5"
-  printf '  %-16s %s\n' "Username" "$inuser"
-  printf '  %-16s %s\n' "Password" "$inpass"
-  printf '  %-16s %s\n' "Test from a client" \
-    "curl -x 'socks5h://${inuser}:${inpass}@${myip}:${inport}' https://ipinfo.io/json"
-  info "Allow TCP ${inport} on the IRAN host firewall. Give these SOCKS5 details only to the users who need WARP."
+  printf '  %-16s %s\n' "Server address" "${myip:-THIS-SERVER-IP}"
+  header "Create the host in the Panel now"
+  printf '  %s\n' "Hosts -> Add Host -> Inbound tag: ${tag}"
+  printf '  %s\n' "Address: ${myip:-THIS-SERVER-IP}   Port: ${inport}   (leave the other fields at their defaults)"
+  info "The Panel lists this inbound immediately after the Core update. The generated config works in v2rayNG / v2rayN."
+  info "Allow TCP ${inport} on the IRAN host firewall. Only the host(s) you create on ${tag} use WARP."
   ok "All existing cdn / direct / tunnel inbounds and their routing rules are unchanged."
   rm -f -- "$merged"
   return 0
@@ -3041,19 +3061,34 @@ cmd_warp_unlink() {
   panel_api GET "/core/${core_id}" || die "Could not read Core config ${core_id}."
   local snapshot="$BACKUP_DIR/warp-unlink-core-${core_id}-$(now_tag).json"
   printf '%s\n' "$PANEL_API_BODY" | jq . >"$snapshot"; chmod 600 "$snapshot"
-  local prev
-  prev="$(ls -1t "$BACKUP_DIR"/warp-join-core-*.json 2>/dev/null | head -n1 || true)"
-  [[ -n "$prev" ]] || die "No pre-WARP Core backup found on this host; remove the WARP-LINK outbound/rule manually in the panel."
+  info "Core backup saved: ${snapshot}"
+
+  # Surgical removal from the LIVE config: keeps anything else the operator
+  # changed in the Panel UI, and leaves all original rules intact.
   local merged; merged="$(mktemp)"
-  jq '.config' "$prev" >"$merged" || { rm -f -- "$merged"; die "Could not read ${prev}."; }
-  if ! confirm "Restore Core ${core_id} from ${prev} (removes every WARP inbound/outbound/rule)?"; then
+  if ! jq --arg tag "$WARP_DEDICATED_TAG" --arg link "$WARP_LINK_TAG" '
+     .config
+     | .inbounds  = ([ (.inbounds // [])[] | select((.tag // "") != $tag) ])
+     | .outbounds = ([ (.outbounds // [])[]
+         | select(((.tag // "") != "warp") and ((.tag // "") != $link)) ])
+     | .routing = (.routing // {})
+     | .routing.rules = ([ (.routing.rules // [])[]
+         | select( ((.outboundTag // "") != "warp")
+                   and ((.outboundTag // "") != $link)
+                   and (([(.inboundTag // [])[]] | index($tag)) == null) ) ])
+   ' "$snapshot" >"$merged"; then
+    rm -f -- "$merged"; die "Could not build the cleaned Core config."
+  fi
+  if ! confirm "Remove the dedicated WARP inbound from Core ${core_id} now?"; then
     warn "Skipped."; rm -f -- "$merged"; return 0
   fi
   if ! panel_put_core "$core_id" "$snapshot" "$merged"; then
     error "Panel update failed. Restore from ${snapshot}"; rm -f -- "$merged"; return 1
   fi
   rm -f -- "$merged"
-  ok "Core ${core_id} restored to its original state. All existing configs work exactly as before."
+  state_set_many "WARP_IN_TAG=" "WARP_IN_PORT=" "WARP_IN_SOURCE=" "WARP_IN_PROTOCOL="
+  warn "Delete any Hosts you created for ${WARP_DEDICATED_TAG} in the Panel UI manually."
+  ok "Core ${core_id} cleaned. All existing configs keep their original rules and work exactly as before."
   return 0
 }
 
@@ -3778,7 +3813,7 @@ Commands:
   import-profile 'WARP1:...'  Reuse an existing WARP account, no Cloudflare call
   warp-link       (FOREIGN server) create a dedicated WARP link; prints WARPLINK1:
   warp-link --show  (FOREIGN server) print the saved WARPLINK1 line again
-  warp-inbound 'WARPLINK1:...'  (MAIN PANEL) create ONE new WARP-only inbound
+  warp-inbound 'WARPLINK1:...'  (MAIN PANEL) clone a real inbound as WARP-only
   warp-unlink   (MAIN PANEL server) remove it and restore the original rules
   warp-join 'WARPLINK1:...'  Alias for warp-inbound (kept for compatibility)
   help        Show this help

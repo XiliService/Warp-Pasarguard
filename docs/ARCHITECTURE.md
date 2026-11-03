@@ -73,7 +73,7 @@ does not complete a handshake). Putting a `wireguard` outbound in the Iran
 Core makes exactly the tunnel configs hang; putting a global WARP rule in the
 foreign Core affects every config.
 
-## 3.1 Dedicated WARP link (1.0.17)
+## 3.1 Dedicated WARP link (1.0.18)
 
 A private SOCKS link joins the two Core configs, so WARP is used by the tunnel
 configs only:
@@ -95,8 +95,13 @@ configs only:
   the userspace WARP outbound, and a rule scoped to that inbound. It prints one
   `WARPLINK1:` line with host/port/user/pass.
 * `warp-manager warp-inbound 'WARPLINK1:...'` on the **Iran** server creates ONE
-  brand-new `WARP-DEDICATED` SOCKS5 inbound and routes only that inbound to the
+  brand-new `WARP-DEDICATED` inbound by **cloning an existing VLESS/Reality
+  inbound** (only its tag and port change) and routes only that inbound to the
   foreign link. No existing inbound, outbound or routing rule is modified.
+* It is a normal proxy inbound, not SOCKS5: `core_manager` builds the Panel's
+  inbound list from the Core config, so the new tag is immediately selectable
+  when creating a Host, and the subscription generates a config that works in
+  v2rayNG / v2rayN.
 * `cdn` / `direct` / `tunnel` configs therefore keep their original rules and
   the three foreign IPs. No other config, node or inbound is touched.
 
@@ -215,3 +220,14 @@ the foreign Xray in the first place. Both are useful and independent:
 
 Installing WARP on the Iran server therefore does not "improve" the tunnel;
 it only changes the exit of configs that actually leave from Iran.
+
+
+## 3.3 Why a SOCKS5 inbound was not usable (1.0.17)
+
+1.0.17 added a raw `socks` inbound to the Iran Core config. PasarGuard's
+`GET /api/host/` creation validates `inbound_tag` against
+`core_manager.get_inbounds()` (built from Core configs), and the subscription
+generates client links from the inbound's protocol. A `socks` inbound produces
+no usable v2rayNG / v2rayN config and no normal Host, so the user could not
+create a host with it. From 1.0.18 the dedicated inbound is a clone of a real
+proxy inbound; `warp-inbound` also replaces any leftover 1.0.17 SOCKS inbound.

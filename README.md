@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.17
+  PasarGuard WARP Manager  v1.0.18
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -799,12 +799,19 @@ contains the link password: keep it private.
 
 ---
 
-## One dedicated WARP inbound, all existing configs untouched (1.0.17)
+## One dedicated WARP inbound, all existing configs untouched (1.0.18)
 
 If **no** existing config (`cdn`, `direct` or `tunnel`) should use WARP, create
 a brand-new inbound on the **Iran main panel** server. Only that new inbound
 is routed to the foreign WARP link; every existing inbound, outbound and
 routing rule is left exactly as it was.
+
+**The new inbound is a normal proxy inbound, not SOCKS5.** `warp-inbound`
+clones one of the existing `vless` / `vmess` / `trojan` / `shadowsocks`
+inbounds (preferring a `Reality` / `DC` one), changes only its tag and port,
+and keeps its `streamSettings`. PasarGuard builds its inbound list from the
+Core config, so the new tag appears immediately in the Panel's host form and
+the generated config works in v2rayNG / v2rayN.
 
 ```bash
 # FOREIGN server: print the saved link again (changes nothing)
@@ -817,20 +824,26 @@ sudo warp-manager warp-inbound 'WARPLINK1:...' --yes
 sudo warp-manager status
 ```
 
-`warp-inbound` also restores the original routing rules from the most recent
-`warp-join-core-*.json` backup, undoing the rule splitting done by 1.0.16. It
-then adds:
+Then in the **Panel UI**: `Hosts -> Add Host -> Inbound tag: WARP-DEDICATED`,
+set the address to the Iran server IP and the port printed by the command
+(leave the other fields at their defaults). The new config appears in the
+subscription and is the only one that uses WARP. Allow that TCP port on the
+Iran host firewall.
 
-* a new `WARP-DEDICATED` SOCKS5 inbound (random TCP port, user + password);
+`warp-inbound` uses the live Core config as its baseline and only restores the
+pre-`warp-join` backup when it detects that tunnel tags are still missing from
+the location rules. It then adds:
+
+* a cloned `WARP-DEDICATED` inbound (a real VLESS/VMESS/Trojan config);
 * a `WARP-LINK` SOCKS outbound to the foreign relay, inserted before `BLOCK`;
 * exactly one routing rule, `inboundTag: ["WARP-DEDICATED"] -> WARP-LINK`,
   placed below the leading `BLOCK` rule and above the location rules.
 
-It prints the host, port, username, password and a copy-pasteable `curl` test.
-Give those SOCKS5 details only to the users who need WARP, and allow that TCP
-port on the Iran host firewall. Before applying it also runs a live
-`socks5h://` test from Iran through the foreign link and reports the Cloudflare
-IP, so the WARP path is verified rather than assumed.
+If a 1.0.17 SOCKS5 inbound is already present, it is replaced. Before
+applying, the command also runs a live `socks5h://` test from Iran through the
+foreign link and reports the Cloudflare IP, so the WARP path is verified
+rather than assumed. It prints the inbound tag, protocol, cloned source, port
+and the exact host-creation step.
 
 To remove everything again and restore the original Core config:
 

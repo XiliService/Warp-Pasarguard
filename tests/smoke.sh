@@ -1117,7 +1117,7 @@ state_set PANEL_URL "http://127.0.0.1:8000"
 PANEL_CORE_ID=1
 # Live core = the state left behind by the old (broken) warp-join: the tunnel
 # tag was split out of the Germany rule.
-LIVE='{"id":1,"name":"Default Core Config","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],"config":{"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"[NL] - Tunnel - ArvanCloud","protocol":"vless","port":33613}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Germany","protocol":"vless"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK","ip":["geoip:private"]},{"type":"field","inboundTag":["[DE] - CloudFlare - CDN"],"outboundTag":"Germany"},{"type":"field","inboundTag":["[NL] - Tunnel - ArvanCloud"],"outboundTag":"NetherLands"}]}}}'
+LIVE='{"id":1,"name":"Default Core Config","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],"config":{"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053,"streamSettings":{"network":"tcp","security":"reality"}},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"[NL] - Tunnel - ArvanCloud","protocol":"vless","port":33613},{"tag":"WARP-DEDICATED","protocol":"socks","port":23458}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Germany","protocol":"vless"},{"tag":"WARP-LINK","protocol":"socks"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK","ip":["geoip:private"]},{"type":"field","inboundTag":["[DE] - CloudFlare - CDN","[DE] - Tunnel - ArvanCloud"],"outboundTag":"Germany"},{"type":"field","inboundTag":["[NL] - Tunnel - ArvanCloud"],"outboundTag":"NetherLands"},{"type":"field","inboundTag":["WARP-DEDICATED"],"outboundTag":"WARP-LINK"}]}}}'
 # Pre-join backup = the original, undamaged rules.
 ORIG='{"id":1,"name":"Default Core Config","type":"xray","exclude_inbound_tags":[],"fallbacks_inbound_tags":[],"config":{"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"[NL] - Tunnel - ArvanCloud","protocol":"vless","port":33613}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Germany","protocol":"vless"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK","ip":["geoip:private"]},{"type":"field","inboundTag":["[DE] - CloudFlare - CDN","[DE] - Tunnel - ArvanCloud"],"outboundTag":"Germany"},{"type":"field","inboundTag":["[NL] - Tunnel - ArvanCloud"],"outboundTag":"NetherLands"}]}}}'
 printf '%s\n' "$ORIG" > "$BACKUP_DIR/warp-join-core-1-20261103-145646.json"
@@ -1146,20 +1146,28 @@ check "no existing config is routed to WARP-LINK" \
   bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"WARP-LINK\") | .inboundTag[]] == [\"WARP-DEDICATED\"]' '$WORK/inbound-put.json' >/dev/null"
 check "exactly one WARP rule is added" \
   bash -c "jq -e '[.config.routing.rules[] | select(.outboundTag==\"WARP-LINK\")] | length == 1' '$WORK/inbound-put.json' >/dev/null"
-check "a new dedicated SOCKS inbound is created" \
-  bash -c "jq -e '[.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .protocol] == [\"socks\"]' '$WORK/inbound-put.json' >/dev/null"
+check "the 1.0.17 SOCKS5 inbound is replaced by a real VLESS inbound" \
+  bash -c "jq -e '[.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .protocol] == [\"vless\"]' '$WORK/inbound-put.json' >/dev/null"
+check "no SOCKS5 inbound remains on the Iran core" \
+  bash -c "jq -e '[.config.inbounds[] | select(.protocol==\"socks\")] | length == 0' '$WORK/inbound-put.json' >/dev/null"
+check "the clone keeps the source streamSettings (host-compatible)" \
+  bash -c "jq -e '.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .streamSettings.security == \"reality\"' '$WORK/inbound-put.json' >/dev/null"
+check "the clone has a fresh port, different from the source" \
+  bash -c "jq -e '(.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .port) != 2053' '$WORK/inbound-put.json' >/dev/null"
 check "the WARP rule sits below the leading BLOCK rule" \
   bash -c "jq -e '([.config.routing.rules[].outboundTag] | index(\"BLOCK\")) < ([.config.routing.rules[].outboundTag] | index(\"WARP-LINK\"))' '$WORK/inbound-put.json' >/dev/null"
 check "the WARP-LINK outbound is inserted before BLOCK" \
   bash -c "jq -e '[.config.outbounds[].tag] | index(\"WARP-LINK\") < index(\"BLOCK\")' '$WORK/inbound-put.json' >/dev/null"
 check "no local WARP wireguard outbound remains" \
   bash -c "jq -e '[.config.outbounds[] | select(.tag==\"warp\")] | length == 0' '$WORK/inbound-put.json' >/dev/null"
-check "the dedicated inbound has password auth" \
-  bash -c "jq -e '.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .settings.auth == \"password\"' '$WORK/inbound-put.json' >/dev/null"
+check "the dedicated inbound is panel-visible (tag + protocol + port)" \
+  bash -c "jq -e '.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | has(\"tag\") and has(\"protocol\") and has(\"port\")' '$WORK/inbound-put.json' >/dev/null"
 check "the SOCKS outbound points at the foreign link" \
   bash -c "jq -e '.config.outbounds[] | select(.tag==\"WARP-LINK\") | .settings.servers[0].address == \"95.135.200.231\"' '$WORK/inbound-put.json' >/dev/null"
-check "warp-inbound prints copy-pasteable SOCKS5 client details" \
-  bash -c "grep -q 'socks5h://' '$WORK/inbound-out.txt'"
+check "warp-inbound prints the exact host-creation step" \
+  bash -c "grep -q 'Add Host' '$WORK/inbound-out.txt' && grep -q 'Inbound tag' '$WORK/inbound-out.txt'"
+check "warp-inbound names the cloned source inbound" \
+  bash -c "grep -q 'Cloning inbound' '$WORK/inbound-out.txt'"
 check "warp-inbound reports the live Cloudflare test" \
   bash -c "grep -q 'Live WARP test through the foreign node' '$WORK/inbound-out.txt'"
 check "warp-join is now an alias of warp-inbound (no rule splitting)" \
@@ -1184,7 +1192,7 @@ mkdir -p "$BACKUP_DIR"
 state_set PANEL_API_KEY pg_key_test
 PANEL_CORE_ID=1
 ORIG='{"id":1,"name":"Default Core Config","type":"xray","config":{"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Germany","protocol":"vless"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","outboundTag":"BLOCK"},{"type":"field","inboundTag":["[DE] - CloudFlare - CDN","[DE] - Tunnel - ArvanCloud"],"outboundTag":"Germany"}]}}}'
-LIVE='{"id":1,"name":"Default Core Config","type":"xray","config":{"inbounds":[{"tag":"WARP-DEDICATED","protocol":"socks","port":23458}],"outbounds":[{"tag":"WARP-LINK","protocol":"socks"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","inboundTag":["WARP-DEDICATED"],"outboundTag":"WARP-LINK"}]}}}'
+LIVE='{"id":1,"name":"Default Core Config","type":"xray","config":{"inbounds":[{"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053},{"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},{"tag":"WARP-DEDICATED","protocol":"vless","port":23458}],"outbounds":[{"tag":"DIRECT","protocol":"freedom"},{"tag":"Germany","protocol":"vless"},{"tag":"WARP-LINK","protocol":"socks"},{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"outboundTag":"BLOCK"},{"inboundTag":["[DE] - CloudFlare - CDN","[DE] - Tunnel - ArvanCloud"],"outboundTag":"Germany"},{"inboundTag":["WARP-DEDICATED"],"outboundTag":"WARP-LINK"}]}}}'
 printf '%s\n' "$ORIG" > "$BACKUP_DIR/warp-join-core-1-20261103-145646.json"
 panel_login() { return 0; }
 confirm() { return 0; }
@@ -1206,14 +1214,56 @@ check "warp-unlink removes the dedicated WARP inbound" \
   bash -c "jq -e '[.config.inbounds[] | select(.tag==\"WARP-DEDICATED\")] | length == 0' '$WORK/unlink-put.json' >/dev/null"
 check "warp-unlink removes the WARP-LINK outbound" \
   bash -c "jq -e '[.config.outbounds[] | select(.tag==\"WARP-LINK\")] | length == 0' '$WORK/unlink-put.json' >/dev/null"
+cat >"$WORK/nobackup-e2e.sh" <<'EOS'
+WD="$1"; ROOT="$2"
+WARP_APP_DIR="$WD/nobackup-app"
+source "$ROOT/warp-manager.sh" >/dev/null 2>&1 || true
+state_init
+state_set PANEL_API_KEY pg_key_test
+PANEL_CORE_ID=1
+panel_login() { return 0; }
+confirm() { return 0; }
+curl() { printf '{"ip":"1.1.1.1","org":"Cloudflare"}'; }
+panel_api() {
+  local m="$1" p="$2" b="${3:-}"
+  if [[ "$m" == PUT ]]; then printf '%s' "$b" > "$WD/nobackup-put.json"; PANEL_API_BODY='{}'; return 0; fi
+  PANEL_API_BODY='{"config":{"inbounds":[{"tag":"CDN","protocol":"vless","port":443}],"outbounds":[{"tag":"BLOCK","protocol":"blackhole"}],"routing":{"rules":[{"outboundTag":"BLOCK"}]}}}'
+  return 0
+}
+LINK="$(printf '%s' '{"host":"95.135.200.231","port":31234,"user":"u","pass":"p","tag":"WARP-LINK"}' | base64 -w0)"
+cmd_warp_inbound "$LINK" >/dev/null 2>&1 || exit 1
+exit 0
+EOS
+bash "$WORK/nobackup-e2e.sh" "$WORK" "$ROOT" >/dev/null 2>&1 || true
 check "warp-inbound works without a pre-join backup (live baseline)" \
-  bash -c "WARP_APP_DIR='$WORK/nobackup-app' WARP_MANAGER='$ROOT/warp-manager.sh' bash -c '
-    source \"\$WARP_MANAGER\" >/dev/null 2>&1 || true; state_init
-    state_set PANEL_API_KEY pg_key_test; PANEL_CORE_ID=1
-    panel_login(){ return 0; }; confirm(){ return 0; }; curl(){ printf \"{\\\"ip\\\":\\\"1.1.1.1\\\",\\\"org\\\":\\\"Cloudflare\\\"}\"; }
-    panel_api(){ local m=\"\$1\" p=\"\$2\" b=\"\${3:-}\"; if [[ \"\$m\" == PUT ]]; then printf \"%s\" \"\$b\" > \"$WORK/nobackup-put.json\"; PANEL_API_BODY=\"{}\"; return 0; fi; PANEL_API_BODY=\"{\\\"config\\\":{\\\"inbounds\\\":[{\\\"tag\\\":\\\"CDN\\\",\\\"port\\\":443}],\\\"outbounds\\\":[{\\\"tag\\\":\\\"BLOCK\\\",\\\"protocol\\\":\\\"blackhole\\\"}],\\\"routing\\\":{\\\"rules\\\":[{\\\"outboundTag\\\":\\\"BLOCK\\\"}]}}}\"; return 0; }
-    cmd_warp_inbound \"\$(printf %s \"{\\\"host\\\":\\\"95.135.200.231\\\",\\\"port\\\":31234,\\\"user\\\":\\\"u\\\",\\\"pass\\\":\\\"p\\\",\\\"tag\\\":\\\"WARP-LINK\\\"}\" | base64 -w0)\" >/dev/null 2>&1
-  ' && jq -e '.config.inbounds[] | select(.tag==\"WARP-DEDICATED\")' '$WORK/nobackup-put.json' >/dev/null"
+  bash -c "jq -e '.config.inbounds[] | select(.tag==\"WARP-DEDICATED\") | .protocol == \"vless\"' '$WORK/nobackup-put.json' >/dev/null"
+
+cat >"$WORK/reality-core.json" <<'JSON'
+{"config":{"inbounds":[
+ {"tag":"[DE] - CloudFlare - CDN","protocol":"vless","port":2053,"streamSettings":{"network":"ws"}},
+ {"tag":"[DE] - Tunnel - ArvanCloud","protocol":"vless","port":64710},
+ {"tag":"[DE] - DC - Reality","protocol":"vless","port":443,"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"dest":"www.microsoft.com:443"}}},
+ {"tag":"WARP-DEDICATED","protocol":"socks","port":29580}
+],"outbounds":[],"routing":{"rules":[]}}}
+JSON
+cat >"$WORK/reality-pick.sh" <<'EOS'
+jq -r --arg t 'WARP-DEDICATED' '
+   [ (.config.inbounds // [])[] | select((.tag // "") != $t)
+     | select(((.protocol // "") | ascii_downcase | test("^(vless|vmess|trojan|shadowsocks)$"))) ] as $c
+   | (([$c[] | select((.tag // "") | ascii_downcase | test("reality|dc"))] + $c)
+      | .[0].tag // empty)
+ ' "$1/reality-core.json" | grep -Fqx '[DE] - DC - Reality'
+EOS
+check "warp-inbound prefers a Reality/DC inbound as the clone source" \
+  bash "$WORK/reality-pick.sh" "$WORK"
+check "warp-inbound no longer builds a SOCKS5 inbound with password accounts" \
+  bash -c "! sed -n '/^cmd_warp_inbound()/,/^}/p' '$ROOT/warp-manager.sh' | grep -Fq 'accounts:'"
+check "warp-inbound clones a real inbound (source check)" \
+  bash -c "sed -n '/^cmd_warp_inbound()/,/^}/p' '$ROOT/warp-manager.sh' | grep -Fq 'Cloning inbound'"
+check "warp-inbound mentions v2rayNG / v2rayN in its output (source check)" \
+  bash -c "sed -n '/^cmd_warp_inbound()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'v2rayNG / v2rayN'"
+check "warp-unlink removes WARP items surgically, not by restoring a backup" \
+  bash -c "sed -n '/^cmd_warp_unlink()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'Surgical removal'"
 
 # ---------------------------------------------------------------------------
 printf '\n[8p] warp-link on the foreign relay\n'
