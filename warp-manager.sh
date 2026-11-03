@@ -1929,9 +1929,29 @@ apply_to_panel() {
     if (( ${#ids[@]} == 1 )); then
       core_id="${ids[0]}"
     else
-      local c
-      c="$(choose "Select the Core configuration used by the EXIT NODE:" "${labels[@]}")" || return 1
-      core_id="${ids[$((c - 1))]}"
+      # With several Core configs, prefer the MAIN PANEL core (the one with
+      # "... Tunnel ..." inbounds). This keeps --yes fully non-interactive and
+      # never picks a shared egress relay by accident.
+      local cid picked=""
+      for cid in "${ids[@]}"; do
+        panel_api GET "/core/${cid}" 2>/dev/null || continue
+        if jq -e '[ (.config.inbounds // [])[] | .tag // empty
+                    | select(ascii_downcase | test("tunnel")) ] | length > 0' \
+             <<<"$PANEL_API_BODY" >/dev/null 2>&1; then
+          picked="$cid"; break
+        fi
+      done
+      if [[ -n "$picked" ]]; then
+        core_id="$picked"
+        info "Auto-selected Core config ${core_id} (it has the tunnel inbounds)."
+      elif [[ "$ASSUME_YES" == "1" ]]; then
+        core_id="${ids[0]}"
+        warn "No Core config has tunnel inbounds; using the first one."
+      else
+        local c
+        c="$(choose "Select the Core configuration used by the MAIN PANEL:" "${labels[@]}")" || return 1
+        core_id="${ids[$((c - 1))]}"
+      fi
     fi
   fi
   info "Using core config ID ${core_id}."

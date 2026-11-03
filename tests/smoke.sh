@@ -1099,6 +1099,10 @@ check "install banner no longer tells the user to run on the foreign node" \
   bash -c "! sed -n '/Deployment target - READ CAREFULLY/,/^TXT/p' '$ROOT/warp-manager.sh' | grep -q 'run this script on the FOREIGN node'"
 check "--help documents export-profile / import-profile" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- 'import-profile'"
+check "apply auto-selects the Core with tunnel inbounds" \
+  bash -c "grep -q 'Auto-selected Core config' '$ROOT/warp-manager.sh'"
+check "--yes never opens an interactive Core selector" \
+  bash -c "sed -n '/^apply_to_panel()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'ASSUME_YES'"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
