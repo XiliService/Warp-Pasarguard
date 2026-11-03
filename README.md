@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.13
+  PasarGuard WARP Manager  v1.0.14
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -569,7 +569,7 @@ use a real owner/admin account or provide the key manually.
 
 ---
 
-## Zero-credential key creation (1.0.13)
+## Zero-credential key creation (1.0.14)
 
 `warp-manager key`, `install` and `apply` no longer need you to paste a key or
 even type an admin password when the panel database runs on the same host:
@@ -598,7 +598,7 @@ outbound/rule order, and keeps `DIRECT` first.
 
 ---
 
-## Panel discovery when no host port is published (1.0.13)
+## Panel discovery when no host port is published (1.0.14)
 
 Some PasarGuard deployments run the panel API inside a Docker network with no
 published port, so `127.0.0.1:8000` and the domain both fail. `apply` now:
@@ -618,7 +618,7 @@ Overrides: `WARP_PANEL_CONTAINER=NAME` and `WARP_PANEL_TRANSPORT=nsenter`.
 
 ---
 
-## Reaching the panel API from inside its container (1.0.13)
+## Reaching the panel API from inside its container (1.0.14)
 
 PasarGuard has three official binding modes (`config.py` / `main.py`):
 
@@ -648,7 +648,7 @@ Overrides: `WARP_PANEL_EXEC_UDS`, `WARP_PANEL_EXEC_SCHEME`,
 
 ---
 
-## Why an added WARP outbound can break every config (1.0.13)
+## Why an added WARP outbound can break every config (1.0.14)
 
 Symptom: after `apply`, every client config shows `ping -1`; deleting the
 `warp` outbound and its routing rule immediately restores them. The order was
@@ -662,7 +662,7 @@ kernel WireGuard link and installs addresses, routes, sysctls and policy
 routing rules inside the node container. Those routes are global to the node and
 hijack traffic for every other inbound, so all clients go down.
 
-From 1.0.13 the generated outbound uses the current Xray schema:
+From 1.0.14 the generated outbound uses the current Xray schema:
 
 ```json
 {
@@ -710,7 +710,7 @@ create a new panel core.
 
 ---
 
-## Which server? (1.0.13 - corrected)
+## Which server? (1.0.14 - corrected)
 
 Run `warp-manager` on the **IRAN main panel server**, not on the foreign
 egress relay.
@@ -721,7 +721,7 @@ The Iran Core config has 12 separate inbounds (`... CloudFlare - CDN`,
 are merged into those 3 location inbounds. A WARP rule on the foreign core
 therefore applies to **every** user, which is why all configs dropped.
 
-From 1.0.13 `apply`:
+From 1.0.14 `apply`:
 
 * Finds the `... Tunnel ...` inbound tags in the target Core config.
 * Writes the WARP rule with `inboundTag: [those tags]` and **no** global
@@ -732,3 +732,28 @@ From 1.0.13 `apply`:
   automatic rollback.
 
 See `docs/ARCHITECTURE.md` section 2.1 for the full two-core topology.
+
+---
+
+## Reusing a WARP account on a host that cannot reach Cloudflare (1.0.14)
+
+`api.cloudflareclient.com` (the wgcf registration API) is often blocked on
+Iranian hosts, so `install` fails there with a TLS handshake timeout. The
+WireGuard UDP endpoint is usually still reachable, so create the account once
+on the foreign server and reuse it on the main panel server:
+
+```bash
+sudo warp-manager export-profile                        # foreign server
+sudo warp-manager import-profile 'WARP1:...'            # main panel server
+sudo warp-manager apply --yes
+```
+
+`export-profile` prints one `WARP1:<base64>` line containing only the profile
+metadata (`meta.env` - private key, WARP addresses, peer public key, endpoint).
+`import-profile` validates it, writes it with mode 0600, sets
+`INSTALLED/MODE/ROUTING/PROFILES`, and regenerates the snippets. There is no
+Cloudflare API call and no new WARP account. `create_profile()` now reuses any
+existing valid `meta.env` instead of calling `wgcf register` again.
+
+The install banner also no longer says "run on the foreign node"; it explains
+the corrected two-Core topology from `docs/ARCHITECTURE.md` section 2.1.

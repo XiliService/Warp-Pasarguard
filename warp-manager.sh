@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.13"
+readonly SCRIPT_VERSION="1.0.14"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -92,6 +92,7 @@ MODERN_XRAY=1
 REMOVE_ALL=0
 ALL_TRAFFIC=0
 WARP_TUNNEL_TAGS="[]"
+PROFILE_BLOB=""
 BINDING_PRESET="${WARP_BINDING:+1}"
 BINDING_PRESET="${BINDING_PRESET:-0}"
 
@@ -742,8 +743,17 @@ endpoint_ip() {
 create_profile() {
   local name="$1" src_ip="$2" endpoint="$3" license="$4"
   local dir="$PROFILE_DIR/$name"
-  info "Creating WARP account profile '${name}' (source ${src_ip:-system default}, endpoint ${endpoint})."
   mkdir -p "$dir"; chmod 700 "$dir"
+  # Reuse an existing / imported WARP account. Cloudflare's registration API
+  # (api.cloudflareclient.com) is frequently unreachable from Iranian hosts.
+  if [[ -f "$dir/meta.env" ]] \
+     && [[ -n "$(profile_meta "$name" PRIVATE_KEY)" ]] \
+     && [[ -n "$(profile_meta "$name" PUBLIC_KEY)" ]] \
+     && [[ -n "$(profile_meta "$name" ADDRESS4)" ]]; then
+    ok "Reusing the existing WARP account for profile '${name}' (no Cloudflare registration)."
+    return 0
+  fi
+  info "Creating WARP account profile '${name}' (source ${src_ip:-system default}, endpoint ${endpoint})."
   rm -f "$dir/wgcf-account.toml" "$dir/wgcf-profile.conf"
 
   ( cd "$dir" && "$WGCF_BIN" register --accept-tos ) || die "wgcf register failed for profile '${name}'."
@@ -2002,30 +2012,26 @@ apply_to_panel() {
 print_target_guidance() {
   header "Deployment target - READ CAREFULLY"
   cat <<'TXT'
-  WARP must run on the machine where the traffic actually LEAVES to the
-  Internet (the egress / exit point), not necessarily on the machine that
-  holds the users.
+  Run this script on the MAIN PANEL server (Iran), where all user inbounds
+  live. The foreign server is only an egress relay for its three IPs.
 
-  Typical PasarGuard multi-node topology:
+  Why: the foreign relay Core has just 3 location inbounds, so ALL 12 user
+  configs are merged there. A WARP rule on that Core applies to EVERY user.
+  On the main panel Core each config category is a separate inbound, so WARP
+  can be scoped to the "... Tunnel ..." inbounds only. cdn / direct configs
+  keep using the three foreign IPs.
 
-    [ Clients ] ---> [ Iran / MAIN PANEL ] ---node/tunnel---> [ NL / DE / PL EXIT NODE ]
-                       users + configs                          egress to Internet
-                                                                ^
-                                                                |
-                                              WARP outbound belongs HERE
+    [ Clients ] ---> [ Iran / MAIN PANEL ] ---vless---> [ NL / DE / PL relay ]
+                     12 separate inbounds              4 inbounds, 3 IPs
+                     WARP decision HERE                keep this Core untouched
 
-  * tunnel configs : traffic exits from the FOREIGN node (NL/DE/PL).
-                     => run this script on the FOREIGN node (or push the
-                        Xray outbound to that node from the panel).
-  * direct / cdn   : traffic exits from the IRAN server (or the CDN edge).
-                     => WARP on the foreign node has NO effect on them.
-                        Run the script on the IRAN server only if you really
-                        want to cover those configs, and be aware it hosts
-                        the main panel and all users.
-  * Panel Core Settings live on the MAIN panel (Iran), but the generated
-    Xray config is executed by the NODE. With the Xray WireGuard backend the
-    panel pushes it automatically; with the kernel WireGuard backend the
-    interface MUST also exist on the node.
+  The script refuses to apply to a Core with no tunnel inbound (a shared
+  egress relay) unless --all-traffic is given. See docs/ARCHITECTURE.md 2.1.
+
+  If Cloudflare's WARP registration API is unreachable from this server,
+  create the account once on the foreign server and reuse it here:
+      foreign: warp-manager export-profile
+      here:    warp-manager import-profile 'WARP1:...'
 TXT
   line
   return 0
@@ -2556,7 +2562,7 @@ cmd_snippets() {
   header "$APP_NAME v$SCRIPT_VERSION - Panel Snippets"
   local f
   for f in outbounds.json routing-rules.json balancers.json README.txt; do
-    [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
+    [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager import-profile' (or install on a host that reaches Cloudflare) first."
   done
   printf '\n--- 1) outbounds.json : paste into "outbounds" AFTER the first outbound, BEFORE any BLOCK ---\n'
   cat "$OUTPUT_DIR/outbounds.json"
@@ -2594,6 +2600,60 @@ cmd_fix_compose() {
   is_installed || warn "WARP is not marked as installed; this only patches docker-compose.yml."
   patch_node_composes
   info "Done. Recreate any container whose restart was declined."
+  return 0
+}
+
+# -----------------------------------------------------------------------------
+# WARP profile transfer: register the account once on a host that can reach
+# Cloudflare, then reuse it on hosts that cannot (no new account, no API call).
+# -----------------------------------------------------------------------------
+cmd_export_profile() {
+  state_init
+  local names name f blob
+  names="$(profile_list)"
+  if [[ -z "$names" ]]; then
+    # Fall back to any profile directory with a usable meta.env.
+    for f in "$PROFILE_DIR"/*/meta.env; do
+      [[ -f "$f" ]] || continue
+      name="$(basename "$(dirname "$f")")"
+      names="$name"; break
+    done
+  fi
+  [[ -n "$names" ]] || die "No WARP profile found. Install WARP once on a host that can reach Cloudflare."
+  name="${names%% *}"
+  f="$PROFILE_DIR/$name/meta.env"
+  [[ -f "$f" ]] || die "Profile '${name}' has no meta.env."
+  grep -q '^PRIVATE_KEY=' "$f" || die "Profile '${name}' is incomplete."
+  blob="$(base64 -w0 < "$f")" || die "Could not encode the profile."
+  header "$APP_NAME v$SCRIPT_VERSION - Export WARP profile"
+  warn "This line contains the WireGuard PRIVATE KEY. Keep it private and delete it after use."
+  printf '\nWARP1:%s\n\n' "$blob"
+  info "On the other server run: warp-manager import-profile 'WARP1:<line above>'"
+  return 0
+}
+
+cmd_import_profile() {
+  local blob="${1:-}" name="default" f tmp
+  [[ -n "$blob" ]] || die "Usage: warp-manager import-profile 'WARP1:...' (get the line from export-profile)."
+  state_init
+  tmp="$(mktemp)"
+  if ! printf '%s' "$blob" | base64 -d > "$tmp" 2>/dev/null; then
+    rm -f -- "$tmp"; die "Invalid profile data: base64 decoding failed."
+  fi
+  grep -q '^PRIVATE_KEY=' "$tmp" || { rm -f -- "$tmp"; die "Invalid profile data: PRIVATE_KEY missing."; }
+  grep -q '^PUBLIC_KEY=' "$tmp" || { rm -f -- "$tmp"; die "Invalid profile data: PUBLIC_KEY missing."; }
+  grep -q '^ADDRESS4=' "$tmp" || { rm -f -- "$tmp"; die "Invalid profile data: ADDRESS4 missing."; }
+  mkdir -p "$PROFILE_DIR/$name"; chmod 700 "$PROFILE_DIR/$name"
+  mv -f -- "$tmp" "$PROFILE_DIR/$name/meta.env"
+  chmod 600 "$PROFILE_DIR/$name/meta.env"
+  state_set_many "INSTALLED=1" "MODE=xray" "TARGET=panel" "BINDING=single" \
+    "ROUTING=domains" "DOMAINS=$DEFAULT_DOMAINS" "ENDPOINT=$DEFAULT_ENDPOINT" \
+    "PROFILES=$name" "PROFILE_IMPORTED=1" "SCRIPT_VERSION=$SCRIPT_VERSION"
+  MODE="xray"; ROUTING="domains"; DOMAINS_CSV="$DEFAULT_DOMAINS"
+  MODERN_XRAY=1; RULE_PREPEND=0
+  build_snippets "$name" || die "Could not generate the panel snippets from the imported profile."
+  ok "WARP profile '${name}' imported. No Cloudflare registration was needed."
+  info "Next: warp-manager apply --yes"
   return 0
 }
 
@@ -3300,6 +3360,8 @@ Commands:
   backup      Full backup: panel/node files, database, compose, core configs
   restore DIR Restore files from a full backup (DB steps in RESTORE.md)
   key         Create/reuse the dedicated Panel API key
+  export-profile  Print the WARP profile as one WARP1: line (private!)
+  import-profile 'WARP1:...'  Reuse an existing WARP account, no Cloudflare call
   help        Show this help
 
 Server selection: install on the MAIN PANEL server (Iran), where the user
@@ -3376,7 +3438,8 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key|export-profile|import-profile) COMMAND="$1"; shift ;;
+      WARP1:*) PROFILE_BLOB="${1#WARP1:}"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -3484,6 +3547,8 @@ main() {
     backup)    require_root; cmd_backup ;;
     restore)   require_root; cmd_restore "${RESTORE_PATH:-}" ;;
     key)       require_root; cmd_key ;;
+    export-profile) require_root; cmd_export_profile ;;
+    import-profile) require_root; cmd_import_profile "$PROFILE_BLOB" ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac

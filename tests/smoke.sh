@@ -103,7 +103,7 @@ check "menu exits cleanly on option 6" bash -c "printf '%s' \"\$1\" | grep -q 'G
 printf '\n[5] Dry-run install plan\n'
 plan_out="$(WARP_APP_DIR="$WORK/plan-app" bash "$ROOT/warp-manager.sh" install \
   --mode xray --target exit --binding single --routing domains --yes --dry-run 2>&1 || true)"
-check "plan shows the deployment target guidance" bash -c "printf '%s' \"\$1\" | grep -q 'EXIT NODE'" _ "$plan_out"
+check "plan shows the deployment target guidance" bash -c "printf '%s' \"\$1\" | grep -q 'MAIN PANEL server'" _ "$plan_out"
 check "plan shows the selected backend" bash -c "printf '%s' \"\$1\" | grep -q 'xray'" _ "$plan_out"
 check "dry-run makes no changes" bash -c "printf '%s' \"\$1\" | grep -q 'No changes were made'" _ "$plan_out"
 check "dry-run created no wgcf binary" test ! -e "$WORK/plan-app/bin/wgcf"
@@ -1067,6 +1067,38 @@ check "apply refuses a shared egress core with no tunnel inbound" \
   bash -c '[[ "$1" == *"shared egress relay"* ]]' _ "$guard"
 check "--all-traffic is documented" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--all-traffic'"
+
+# ---------------------------------------------------------------------------
+printf '\n[8n] Reuse a WARP account when Cloudflare registration is blocked\n'
+mkdir -p "$WORK/export-app/profiles/default"
+cat >"$WORK/export-app/profiles/default/meta.env" <<'EOF'
+TAG=warp
+INTERFACE=warp
+PRIVATE_KEY=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+ADDRESS4=172.16.0.2/32
+ADDRESS6=fd01:db8::2/128
+PUBLIC_KEY=bmXOC+F1FxEMF9dyiK2H5/1SUtzH0YoV0CV9KtCkQpHyo=
+ENDPOINT=engage.cloudflareclient.com:2408
+EOF
+printf 'PROFILES=default\n' >"$WORK/export-app/state.env"
+blob="$(WARP_APP_DIR="$WORK/export-app" bash "$ROOT/warp-manager.sh" export-profile 2>/dev/null | grep '^WARP1:' || true)"
+check "export-profile emits a single WARP1: line" \
+  bash -c '[[ "$1" == WARP1:* && "$1" != *" "* ]]' _ "$blob"
+check "export-profile refuses an app with no profile" \
+  bash -c "! WARP_APP_DIR='$WORK/empty-export' bash '$ROOT/warp-manager.sh' export-profile >/dev/null 2>&1"
+import_out="$(WARP_APP_DIR="$WORK/import-app" bash "$ROOT/warp-manager.sh" import-profile "$blob" 2>&1 || true)"
+check "import-profile writes the profile without any Cloudflare call" \
+  bash -c '[[ "$1" == *"No Cloudflare registration was needed"* ]]' _ "$import_out"
+check "import-profile generates the outbound snippets" \
+  bash -c "jq -e '.[0].settings.noKernelTun == true' '$WORK/import-app/outbound/outbounds.json' >/dev/null"
+check "import-profile marks the deployment installed" \
+  bash -c "grep -q 'INSTALLED=1' '$WORK/import-app/state.env'"
+check "create_profile reuses an existing account instead of calling wgcf" \
+  bash -c "sed -n '/^create_profile()/,/^}/p' '$ROOT/warp-manager.sh' | grep -q 'Reusing the existing WARP account'"
+check "install banner no longer tells the user to run on the foreign node" \
+  bash -c "! sed -n '/Deployment target - READ CAREFULLY/,/^TXT/p' '$ROOT/warp-manager.sh' | grep -q 'run this script on the FOREIGN node'"
+check "--help documents export-profile / import-profile" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- 'import-profile'"
 
 # ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
