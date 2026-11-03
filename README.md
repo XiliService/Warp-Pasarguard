@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.9
+  PasarGuard WARP Manager  v1.0.10
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -569,7 +569,7 @@ use a real owner/admin account or provide the key manually.
 
 ---
 
-## Zero-credential key creation (1.0.9)
+## Zero-credential key creation (1.0.10)
 
 `warp-manager key`, `install` and `apply` no longer need you to paste a key or
 even type an admin password when the panel database runs on the same host:
@@ -595,3 +595,23 @@ A reinstall registers a NEW WARP account, so the `warp` outbound you pasted
 earlier contains an OLD private key. Run `sudo warp-manager apply --yes` once:
 it rewrites the Core config with the current key, restores the correct
 outbound/rule order, and keeps `DIRECT` first.
+
+---
+
+## Panel discovery when no host port is published (1.0.10)
+
+Some PasarGuard deployments run the panel API inside a Docker network with no
+published port, so `127.0.0.1:8000` and the domain both fail. `apply` now:
+
+1. Reads `UVICORN_PORT` from the panel container's environment.
+2. Probes the container's Docker bridge IP on common internal ports.
+3. Falls back to `nsenter` into the panel container's network namespace, so
+   `127.0.0.1:<port>` reaches the panel's own loopback even with no published
+   port. The chosen container and transport are saved in `state.env` and reused
+   by later runs.
+
+`install_packages` now installs `util-linux` when `nsenter` is missing. If all
+probes still fail, `apply` prints every URL it tried plus `docker ps` output so
+the remaining problem is visible in the log.
+
+Overrides: `WARP_PANEL_CONTAINER=NAME` and `WARP_PANEL_TRANSPORT=nsenter`.

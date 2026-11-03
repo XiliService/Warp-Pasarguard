@@ -222,7 +222,7 @@ PostgreSQL/SQLite dump. Core Settings are also saved individually as
 
 ## `warp-manager: command not found` after `remove`
 
-Older versions removed the command on `remove --yes`. From 1.0.9 it is kept
+Older versions removed the command on `remove --yes`. From 1.0.10 it is kept
 unless `--uninstall-manager` is passed. If it is already gone, reinstall the
 bootstrap (the backup directory and `warp-manager.sh` are always preserved):
 
@@ -231,3 +231,19 @@ curl -fsSL -H 'Accept: application/vnd.github.raw' \
   'https://api.github.com/repos/XiliService/Warp-Pasarguard/contents/install.sh?ref=arena/01417195-warp-pasarguard' \
   | sudo bash -s -- --branch arena/01417195-warp-pasarguard --no-menu
 ```
+
+---
+
+## `Created dedicated API key` but `no panel endpoint answered`
+
+The key was written to the panel database successfully; only the HTTP endpoint
+was unreachable. From 1.0.10 the script probes Docker bridge IPs and uses
+`nsenter` to reach the panel from inside its own container. Re-run:
+
+```bash
+sudo warp-manager update --yes
+sudo warp-manager apply --yes
+```
+
+If it still fails, the log now lists every URL tried and the running
+containers. Make sure the `pasarguard/panel` container is actually running.

@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.9"
+readonly SCRIPT_VERSION="1.0.10"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -112,6 +112,12 @@ ROUTE_BEFORE=""
 COMPOSE_FILE=""
 COMPOSE_SERVICES=""
 PANEL_ACCESS_TOKEN=""
+# When the panel publishes no host port, all API calls are made through the
+# panel container's network namespace (nsenter) instead of the host network.
+PANEL_CONTAINER="${WARP_PANEL_CONTAINER:-}"
+PANEL_TRANSPORT="${WARP_PANEL_TRANSPORT:-direct}"
+PANEL_NS_PID=""
+PANEL_NS_UNIX=""
 RULE_PREPEND=0  # default ROUTING=domains; never make WARP the default outbound
 
 # -----------------------------------------------------------------------------
@@ -605,7 +611,7 @@ detect_xray_version() {
 # Prerequisites / wgcf
 # -----------------------------------------------------------------------------
 install_packages() {
-  local -a pkgs=(curl ca-certificates jq iproute2 coreutils sed gawk grep tar)
+  local -a pkgs=(curl ca-certificates jq iproute2 coreutils sed gawk grep tar util-linux)
   [[ "$MODE" == "kernel" ]] && pkgs+=(wireguard-tools)
   local -a missing=()
   local p
@@ -615,6 +621,7 @@ install_packages() {
       curl) have curl || missing+=("$p") ;;
       iproute2) have ip || missing+=("$p") ;;
       wireguard-tools) have wg || missing+=("$p") ;;
+      util-linux) have nsenter || missing+=("$p") ;;
       *) ;;
     esac
   done
@@ -1184,10 +1191,19 @@ load_saved_api_key() {
 }
 
 load_saved_panel_url() {
+  local u c t x
   if [[ -z "$PANEL_URL" ]]; then
-    local u; u="$(state_get PANEL_URL '')"
+    u="$(state_get PANEL_URL '')"
     if [[ -n "$u" ]]; then PANEL_URL="$u"; fi
   fi
+  if [[ -z "$PANEL_CONTAINER" ]]; then
+    c="$(state_get PANEL_CONTAINER '')"
+    if [[ -n "$c" ]]; then PANEL_CONTAINER="$c"; fi
+  fi
+  t="$(state_get PANEL_TRANSPORT '')"
+  if [[ -n "$t" ]]; then PANEL_TRANSPORT="$t"; fi
+  x="$(state_get PANEL_NS_UNIX '')"
+  if [[ -n "$x" ]]; then PANEL_NS_UNIX="$x"; fi
   return 0
 }
 
@@ -1197,14 +1213,14 @@ load_saved_panel_url() {
 panel_probe_key() {
   local base="$1" k="$2" tmp err code body
   tmp="$(mktemp)"; err="$(mktemp)"
-  local -a opts=(-sS -X GET --connect-timeout 5 --max-time 15 \
+  local -a opts=(-sS -X GET --connect-timeout 2 --max-time 8 \
                  -H "X-Api-Key: ${PANEL_API_KEY}" \
                  -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
   if [[ "$k" == "1" ]]; then opts+=(-k); fi
   PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
   # NOTE: the panel uses APIRouter(prefix="/api/core") + @router.get("s"),
   # so the list endpoint is /api/cores (NOT /api/core/s).
-  code="$(curl "${opts[@]}" "${base%/}/api/cores" 2>"$err")" || {
+  code="$(curl_panel "${opts[@]}" "${base%/}/api/cores" 2>"$err")" || {
     PANEL_NETERR="$(tr '\n' ' ' < "$err" | cut -c1-240)"
     rm -f -- "$tmp" "$err"; return 1
   }
@@ -1224,35 +1240,42 @@ panel_probe_key() {
 # when the public dashboard domain does not resolve (or is firewalled) from
 # the VPS itself. Read-only discovery; nothing is changed here.
 local_panel_urls() {
-  local name image ports port ip cport
+  local line name image ports port cport ip ips uvicorn_port env
+  local -a cports=()
   have docker || return 0
-  have jq || return 0
-  while IFS= read -r name; do
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    name="${line%% *}"; image="${line#* }"
     [[ -n "$name" ]] || continue
-    image="$(docker inspect "$name" --format '{{.Config.Image}}' 2>/dev/null || true)"
-    [[ "$image" == *pasarguard/panel* ]] || continue
-    local uvicorn_port
-    uvicorn_port="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
-                   | grep '^UVICORN_PORT=' | head -n1 | cut -d= -f2- || true)"
-    if [[ "$uvicorn_port" =~ ^[0-9]+$ ]]; then
-      printf 'http://127.0.0.1:%s\n' "$uvicorn_port"
-    fi
+    case "$image" in *timescale*|*postgres*|*redis*|*node*) continue ;; esac
+    [[ "$image" == *pasarguard* || "$name" == *pasarguard* || "$name" == *panel* ]] || continue
+
+    env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+    uvicorn_port="$(grep '^UVICORN_PORT=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    if [[ ! "$uvicorn_port" =~ ^[0-9]+$ ]]; then uvicorn_port="8000"; fi
     ports="$(docker inspect "$name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null || true)"
-    if [[ -z "$ports" || "$ports" == "null" || "$ports" == "{}" ]]; then
-      continue
-    fi
-    while IFS= read -r port; do
-      if [[ "$port" =~ ^[0-9]+$ ]]; then printf 'http://127.0.0.1:%s\n' "$port"; fi
-    done < <(jq -r 'to_entries[] | .value[]? | .HostPort // empty' <<<"$ports" 2>/dev/null)
-    ip="$(docker inspect "$name" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null || true)"
-    ip="${ip%% *}"
-    if [[ -n "$ip" && "$ip" != "<no value>" ]]; then
+    cports=("$uvicorn_port" 8080 80 3000 9000 2053 2096 443 8443)
+    if [[ -n "$ports" && "$ports" != "null" && "$ports" != "{}" ]] && have jq; then
+      while IFS= read -r cport; do
+        cport="${cport%%/*}"
+        if [[ "$cport" =~ ^[0-9]+$ ]]; then cports+=("$cport"); fi
+      done < <(jq -r 'to_entries[]? | .key' <<<"$ports" 2>/dev/null || true)
       while IFS= read -r port; do
-        cport="${port%%/*}"
-        if [[ "$cport" =~ ^[0-9]+$ ]]; then printf 'http://%s:%s\n' "$ip" "$cport"; fi
-      done < <(jq -r 'to_entries[] | .key' <<<"$ports" 2>/dev/null)
+        if [[ "$port" =~ ^[0-9]+$ ]]; then printf 'http://127.0.0.1:%s\n' "$port"; fi
+      done < <(jq -r 'to_entries[]? | .value[]? | .HostPort // empty' <<<"$ports" 2>/dev/null || true)
     fi
-  done < <(docker ps --format '{{.Names}}' 2>/dev/null || true)
+    # Host loopback (works only if a port was published) and the container's
+    # own bridge IP (always reachable from the host on a Docker network).
+    printf 'http://127.0.0.1:%s\n' "$uvicorn_port"
+    ips="$(docker inspect "$name" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' 2>/dev/null || true)"
+    for ip in $ips; do
+      [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+      for cport in "${cports[@]}"; do
+        printf 'http://%s:%s\n' "$ip" "$cport"
+      done
+      printf 'https://%s:443\nhttps://%s:8443\nhttps://%s:2096\n' "$ip" "$ip" "$ip"
+    done
+  done < <(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
   return 0
 }
 
@@ -1271,15 +1294,121 @@ local_port_probes() {
 }
 
 # Single login attempt. Sets PANEL_ACCESS_TOKEN on success, otherwise records
+# ---------------------------------------------------------------------------
+# Panel transport
+# ---------------------------------------------------------------------------
+# List containers that could be running the PasarGuard panel API.
+panel_container_names() {
+  have docker || return 0
+  local line name image
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    name="${line%% *}"; image="${line#* }"
+    [[ -n "$name" ]] || continue
+    case "$image" in *timescale*|*postgres*|*redis*|*node*) continue ;; esac
+    if [[ "$image" == *pasarguard* || "$name" == *pasarguard* || "$name" == *panel* ]]; then
+      printf '%s\n' "$name"
+    fi
+  done < <(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)
+  return 0
+}
+
+# curl wrapper used ONLY for panel API calls. When PANEL_TRANSPORT=nsenter the
+# request runs in the panel container's network namespace, so 127.0.0.1 is the
+# container's own loopback (works even with no published port / UDS proxy).
+curl_panel() {
+  local -a pre=() extra=()
+  if [[ "$PANEL_TRANSPORT" == "nsenter" ]]; then
+    local pid="${PANEL_NS_PID:-}"
+    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" == "0" ]] && [[ -n "$PANEL_CONTAINER" ]] && have docker; then
+      pid="$(docker inspect "$PANEL_CONTAINER" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    fi
+    if [[ "$pid" =~ ^[0-9]+$ && "$pid" != "0" ]] && have nsenter; then
+      PANEL_NS_PID="$pid"
+      if [[ -n "$PANEL_NS_UNIX" ]]; then
+        pre=(nsenter -t "$pid" -n -m --)
+        extra+=(--unix-socket "$PANEL_NS_UNIX")
+      else
+        pre=(nsenter -t "$pid" -n --)
+      fi
+    fi
+  fi
+  if (( ${#pre[@]} > 0 )); then
+    "${pre[@]}" curl "${extra[@]}" "$@"
+  else
+    curl "${extra[@]}" "$@"
+  fi
+}
+
+# Try to reach the panel API from inside each candidate container's netns.
+# Used as a last resort after every host-level URL has failed.
+panel_nsenter_probe() {
+  local mode="${1:-key}"
+  have docker || return 1
+  if [[ "$mode" == "key" && -z "$PANEL_API_KEY" ]]; then return 1; fi
+  if ! have nsenter; then
+    warn "nsenter is not installed; cannot reach a panel container without a published port."
+    return 1
+  fi
+  local name pid env port cport k base saved_transport="$PANEL_TRANSPORT"
+  local -a names=() ports=()
+  while IFS= read -r name; do names+=("$name"); done < <(panel_container_names)
+  if (( ${#names[@]} == 0 )); then return 1; fi
+  info "Trying the panel API from inside ${#names[@]} container(s) via nsenter."
+  for name in "${names[@]}"; do
+    pid="$(docker inspect "$name" --format '{{.State.Pid}}' 2>/dev/null || true)"
+    if [[ ! "$pid" =~ ^[0-9]+$ || "$pid" == "0" ]]; then continue; fi
+    env="$(docker inspect "$name" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null || true)"
+    port="$(grep '^UVICORN_PORT=' <<<"$env" | head -n1 | cut -d= -f2- || true)"
+    ports=(8000 8080 80 3000 9000 2053)
+    if [[ "$port" =~ ^[0-9]+$ ]]; then ports=("$port" "${ports[@]}"); fi
+    if have jq; then
+      while IFS= read -r cport; do
+        cport="${cport%%/*}"
+        if [[ "$cport" =~ ^[0-9]+$ ]]; then ports+=("$cport"); fi
+      done < <(docker inspect "$name" --format '{{json .NetworkSettings.Ports}}' 2>/dev/null \
+               | jq -r 'to_entries[]? | .key' 2>/dev/null || true)
+    fi
+    for cport in "${ports[@]}"; do
+      for k in 0 1; do
+        [[ "$k" == "1" && "$cport" != "443" && "$cport" != "8443" && "$cport" != "2096" ]] && continue
+        base="http://127.0.0.1:${cport}"
+        [[ "$k" == "1" ]] && base="https://127.0.0.1:${cport}"
+        PANEL_TRANSPORT="nsenter"
+        PANEL_NS_PID="$pid"
+        PANEL_NS_UNIX=""
+        if [[ "$mode" == "token" ]]; then
+          panel_try_login "$base" "$k" || { PANEL_TRANSPORT="$saved_transport"; continue; }
+        else
+          panel_probe_key "$base" "$k" || { PANEL_TRANSPORT="$saved_transport"; continue; }
+        fi
+        PANEL_URL="$base"
+        PANEL_CONTAINER="$name"
+        PANEL_NS_UNIX=""
+        INSECURE="$k"
+        state_set PANEL_URL "$base"
+        state_set PANEL_CONTAINER "$name"
+        state_set PANEL_TRANSPORT nsenter
+        state_set PANEL_NS_UNIX ""
+        ok "Panel API reachable inside container ${name} (${base})."
+        return 0
+      done
+    done
+  done
+  PANEL_TRANSPORT="$saved_transport"
+  PANEL_NS_PID=""; PANEL_NS_UNIX=""
+  return 1
+}
+
 # the exact reason in PANEL_NETERR (curl error) or PANEL_HTTP/PANEL_BODY.
 panel_try_login() {
   local base="$1" k="$2" tmp err code body
   tmp="$(mktemp)"; err="$(mktemp)"
-  local -a opts=(-sS -X POST --connect-timeout 8 --max-time 25 \
+  local -a opts=(-sS -X POST --connect-timeout 3 --max-time 12 \
                  -H 'Accept: application/json' -o "$tmp" -w '%{http_code}')
   if [[ "$k" == "1" ]]; then opts+=(-k); fi
   PANEL_NETERR=""; PANEL_HTTP=""; PANEL_BODY=""
-  code="$(curl "${opts[@]}" --data-urlencode "username=${PANEL_USER}" \
+  code="$(curl_panel "${opts[@]}" --data-urlencode "username=${PANEL_USER}" \
         --data-urlencode "password=${PANEL_PASS}" \
         "${base%/}/api/admin/token" 2>"$err")" || {
     PANEL_NETERR="$(tr '\n' ' ' < "$err" | cut -c1-240)"
@@ -1316,21 +1445,37 @@ panel_login() {
       error "No panel URL configured and no local panel found."
       return 1
     fi
-    info "Checking ${#urls[@]} candidate panel endpoint(s) with the API key."
-    for pass in "${passes[@]}"; do
-      for url in "${urls[@]}"; do
-        k=0
-        if [[ "$pass" == "2" || "$INSECURE" == "1" ]]; then k=1; fi
-        if panel_probe_key "$url" "$k"; then
-          PANEL_URL="$url"; INSECURE="$k"
-          ok "Panel API key accepted at ${url}"
-          return 0
-        fi
-      done
+    # Plain HTTP URLs only need one attempt; HTTPS URLs also get a second
+    # attempt with TLS verification relaxed when --insecure was not requested.
+    local -a probes=() probe
+    for url in "${urls[@]}"; do
+      if [[ "$url" == https://* ]]; then
+        probes+=("${url}|${INSECURE:-0}")
+        [[ "$INSECURE" != "1" ]] && probes+=("${url}|1")
+      else
+        probes+=("${url}|0")
+      fi
     done
+    info "Checking ${#probes[@]} candidate panel endpoint(s) with the API key."
+    for probe in "${probes[@]}"; do
+      url="${probe%|*}"; k="${probe##*|}"
+      if panel_probe_key "$url" "$k"; then
+        PANEL_URL="$url"; INSECURE="$k"
+        ok "Panel API key accepted at ${url}"
+        return 0
+      fi
+    done
+    if panel_nsenter_probe key; then return 0; fi
     error "The API key did not work on any panel endpoint."
     if [[ -n "$PANEL_NETERR" ]]; then error "  Last network error: ${PANEL_NETERR}"; fi
     error "  Last response (HTTP ${PANEL_HTTP}): ${PANEL_BODY}"
+    local tried
+    for tried in "${urls[@]}"; do info "  Tried: ${tried}"; done
+    if have docker; then
+      while IFS= read -r tried; do
+        [[ -n "$tried" ]] && info "  Container: ${tried}"
+      done < <(docker ps --format '{{.Names}} {{.Image}} {{.Ports}}' 2>/dev/null || true)
+    fi
     warn "Create the key in Panel -> API Keys with cores:read + cores:update."
     warn "It must look like pg_key_<uuid>. Set --panel-url if the panel is remote."
     return 1
@@ -1397,6 +1542,7 @@ panel_login() {
     done
   done
 
+  if panel_nsenter_probe token; then return 0; fi
   error "Panel login failed."
   error "  ${configured} -> ${configured_err:-unknown error}"
   if [[ -n "$auth_rejected" ]]; then
@@ -1429,7 +1575,7 @@ panel_api() {
   if [[ -n "$data" ]]; then
     opts+=(-H 'Content-Type: application/json' --data-binary "$data")
   fi
-  code="$(curl "${opts[@]}" "$(panel_endpoint)${path}" 2>/dev/null)" || {
+  code="$(curl_panel "${opts[@]}" "$(panel_endpoint)${path}" 2>/dev/null)" || {
     rm -f -- "$bodyfile"; return 1;
   }
   PANEL_API_BODY="$(cat "$bodyfile")"
@@ -2880,6 +3026,7 @@ Other options:
 
 Environment variables:
   WARP_APP_DIR, WARP_BRANCH, WARP_UPDATE_URL, WARP_MODE, WARP_TARGET,
+  WARP_PANEL_CONTAINER, WARP_PANEL_TRANSPORT (use nsenter for an unpublished panel),
   WARP_BINDING, WARP_SRC_IP, WARP_LABEL, WARP_LABELS, WARP_ENDPOINT, WARP_ROUTING,
   WARP_DOMAINS, WARP_LICENSE_KEY, WARP_APPLY_PANEL, WGCF_VERSION,
   WARP_YES, WARP_DRY_RUN, WARP_FORCE, WARP_INSECURE, WARP_DEBUG,

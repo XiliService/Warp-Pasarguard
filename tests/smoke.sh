@@ -834,6 +834,66 @@ check "remove --yes keeps the warp-manager command" \
   bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q -- '--uninstall-manager'"
 
 # ---------------------------------------------------------------------------
+printf '\n[8j] Panel API transport when no host port is published\n'
+mkdir -p "$WORK/fakebin9"
+cat >"$WORK/fakebin9/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps) printf 'pasarguard-pasarguard-1 pasarguard/panel:latest\n'
+      printf 'pasarguard-timescaledb-1 timescale/timescaledb:latest\n'; exit 0 ;;
+  inspect)
+    case "$4" in
+      *State.Pid*) printf '4242\n' ;;
+      *Config.Env*) printf '\n' ;;
+      *NetworkSettings.Ports*) printf '{}\n' ;;
+      *NetworkSettings.Networks*) printf '172.18.0.5 \n' ;;
+      *Config.Image*) printf 'pasarguard/panel:latest\n' ;;
+      *) printf '\n' ;;
+    esac; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin9/docker"
+cat >"$WORK/fakebin9/nsenter" <<'EOF'
+#!/usr/bin/env bash
+while [[ "${1:-}" != "--" && $# -gt 0 ]]; do shift; done
+[[ $# -gt 0 ]] && shift
+exec env WARP_NSENTER_USED=1 "$@"
+EOF
+chmod +x "$WORK/fakebin9/nsenter"
+cat >"$WORK/fakebin9/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '200\n'
+EOF
+chmod +x "$WORK/fakebin9/curl"
+urls="$(WARP_APP_DIR="$WORK/urls-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin9:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    local_panel_urls' 2>/dev/null || true)"
+check "local_panel_urls emits the container bridge IP even with no published port" \
+  bash -c '[[ "$1" == *"http://172.18.0.5:8000"* ]]' _ "$urls"
+check "local_panel_urls also emits the host loopback candidate" \
+  bash -c '[[ "$1" == *"http://127.0.0.1:8000"* ]]' _ "$urls"
+transport="$(WARP_APP_DIR="$WORK/ns-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin9:$PATH" bash -c '
+    source "$WARP_MANAGER"; state_init
+    PANEL_TRANSPORT="nsenter"; PANEL_CONTAINER="pasarguard-pasarguard-1"
+    PANEL_NS_PID="4242"
+    WARP_NSENTER_USED=""; curl_panel -sS -X GET http://127.0.0.1:8000/api/cores >/dev/null
+    printf "%s|%s" "$PANEL_TRANSPORT" "$(state_get PANEL_CONTAINER "")"' 2>/dev/null || true)"
+check "curl_panel uses nsenter when the panel has no host port" \
+  bash -c '[[ "$1" == nsenter* ]]' _ "$transport"
+ns_state="$(WARP_APP_DIR="$WORK/ns-app2" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin9:$PATH" bash -c '
+    source "$WARP_MANAGER"; state_init
+    PANEL_API_KEY="pg_key_test"
+    panel_probe_key() { return 0; }
+    panel_nsenter_probe >/dev/null 2>&1
+    printf "%s|%s|%s" "$PANEL_TRANSPORT" "$(state_get PANEL_CONTAINER "")" "$(state_get PANEL_TRANSPORT "")"' 2>/dev/null || true)"
+check "panel_nsenter_probe persists container and transport for later runs" \
+  bash -c '[[ "$1" == "nsenter|pasarguard-pasarguard-1|nsenter" ]]' _ "$ns_state"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \
