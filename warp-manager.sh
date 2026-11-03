@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.5"
+readonly SCRIPT_VERSION="1.0.6"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -1194,6 +1194,20 @@ local_panel_urls() {
   return 0
 }
 
+# Common local ports used by a panel container (host networking or an
+# unpublished bridge port). Only tried when --allow-local-panel is given.
+local_port_probes() {
+  local p
+  local -a ports=(8000 8080 80 443 8443 2053 2096 9000 3000)
+  for p in "${ports[@]}"; do
+    printf 'http://127.0.0.1:%s\n' "$p"
+    if [[ "$p" == "443" || "$p" == "8443" || "$p" == "2096" ]]; then
+      printf 'https://127.0.0.1:%s\n' "$p"
+    fi
+  done
+  return 0
+}
+
 # Single login attempt. Sets PANEL_ACCESS_TOKEN on success, otherwise records
 # the exact reason in PANEL_NETERR (curl error) or PANEL_HTTP/PANEL_BODY.
 panel_try_login() {
@@ -1233,13 +1247,19 @@ panel_login() {
     PANEL_PASS="$(ui_read_secret "Panel admin password: ")" || return 1
   fi
 
-  local configured="$PANEL_URL" b url pass k configured_err=""
+  local configured="$PANEL_URL" b url pass k configured_err="" auth_rejected=""
   local -a urls=("$configured") passes=(1)
   [[ "$INSECURE" == "1" ]] || passes+=(2)
   while IFS= read -r b; do
     [[ -n "$b" ]] || continue
     [[ " ${urls[*]} " == *" ${b} "* ]] || urls+=("$b")
   done < <(local_panel_urls)
+  if [[ "$ALLOW_LOCAL_PANEL" == "1" ]]; then
+    while IFS= read -r b; do
+      [[ -n "$b" ]] || continue
+      [[ " ${urls[*]} " == *" ${b} "* ]] || urls+=("$b")
+    done < <(local_port_probes)
+  fi
 
   for pass in "${passes[@]}"; do
     if [[ "$pass" == "2" ]]; then
@@ -1265,11 +1285,18 @@ panel_login() {
         if [[ -n "$PANEL_NETERR" ]]; then configured_err="network: ${PANEL_NETERR}"
         else configured_err="HTTP ${PANEL_HTTP}: ${PANEL_BODY}"; fi
       fi
+      if [[ "$PANEL_HTTP" == "401" || "$PANEL_HTTP" == "403" ]] && [[ -z "$auth_rejected" ]]; then
+        auth_rejected="$url"
+      fi
     done
   done
 
   error "Panel login failed."
   error "  ${configured} -> ${configured_err:-unknown error}"
+  if [[ -n "$auth_rejected" ]]; then
+    warn "Panel API found at ${auth_rejected}, but the credentials were rejected (HTTP 401/403)."
+    warn "Re-run with --panel-url ${auth_rejected} and the correct admin password."
+  fi
   local u
   for u in "${urls[@]}"; do info "  Tried endpoint: ${u}"; done
   if (( ${#urls[@]} > 1 )); then
@@ -1752,6 +1779,43 @@ TXT
   info "Run 'warp-manager logs' to inspect service output."
 }
 
+cmd_snippets() {
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - Panel Snippets"
+  local f
+  for f in outbounds.json routing-rules.json balancers.json README.txt; do
+    [[ -f "$OUTPUT_DIR/$f" ]] || die "Missing ${OUTPUT_DIR}/${f}. Run 'warp-manager install' first."
+  done
+  printf '\n--- 1) outbounds.json : paste objects into "outbounds" AFTER the existing first outbound ---\n'
+  cat "$OUTPUT_DIR/outbounds.json"
+  printf '\n--- 2) routing-rules.json : paste objects at the TOP of "routing.rules" ---\n'
+  cat "$OUTPUT_DIR/routing-rules.json"
+  printf '\n--- 3) balancers.json (single mode: empty, nothing to paste) ---\n'
+  cat "$OUTPUT_DIR/balancers.json"
+  cat <<'TXT'
+
+IMPORTANT: copy only what is INSIDE the [ ] brackets - from the first { to
+the last }. Do NOT paste the [ ] brackets into an existing array; add a comma
+after the previous item first.
+
+In the panel: Core Settings -> select the Core used by the EXIT NODE -> edit JSON.
+Keep your existing first outbound first (routing=domains). Save, then run:
+  warp-manager mark-applied --yes
+TXT
+  return 0
+}
+
+cmd_mark_applied() {
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - Confirm Manual Panel Apply"
+  state_set_many \
+    "PANEL_LAST_APPLY=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+    "PANEL_APPLY_METHOD=manual"
+  ok "Panel config marked as applied (manual paste)."
+  info "Verify with: warp-manager status"
+  return 0
+}
+
 cmd_fix_compose() {
   state_init
   header "$APP_NAME v$SCRIPT_VERSION - Fix Compose TUN Permissions"
@@ -2080,9 +2144,10 @@ cmd_status() {
   fi
   if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
     bad "  NOT ACTIVE - the snippets were generated but NOT applied to the panel."
+    bad "  If the panel API is unreachable: 'warp-manager snippets' + paste manually."
     problems=$((problems + 1))
   else
-    ok "  Panel config applied at $(state_get PANEL_LAST_APPLY never)"
+    ok "  Panel config applied ($(state_get PANEL_APPLY_METHOD api)) at $(state_get PANEL_LAST_APPLY never)"
   fi
   line
 
@@ -2112,11 +2177,14 @@ cmd_status() {
   line
 
   if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
-    header "Next step (one command)"
+    header "Next step"
+    info "  1) warp-manager snippets"
+    info "     Paste outbounds.json + routing-rules.json into Core Settings, Save."
+    info "  2) warp-manager mark-applied --yes"
+    info "  Alternative (needs a reachable panel API):"
     local next_url; next_url="$(state_get PANEL_URL '')"
     [[ -n "$next_url" ]] || next_url="PANEL_URL"
-    info "  warp-manager apply --panel-url ${next_url} --panel-user USER --panel-pass PASS --yes"
-    info "  It also re-checks /dev/net/tun on every node container."
+    info "     warp-manager apply --panel-url ${next_url} --panel-user USER --panel-pass PASS --yes"
     line
   fi
   if (( problems == 0 )); then
@@ -2140,7 +2208,7 @@ print_banner() {
   printf '  %-18s %s\n' "Global IPs" "${#DETECTED_IPS[@]}"
   printf '  %-18s %s\n' "Installation" "$([[ "$(state_get INSTALLED 0)" == "1" ]] && printf 'active (%s / %s)' "$(state_get MODE '?')" "$(state_get TARGET '?')" || echo 'not installed')"
   if [[ "$(state_get INSTALLED 0)" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
-    printf '  %-18s %s\n' "Status" "installed, NOT ACTIVE - run 'warp-manager apply'"
+    printf '  %-18s %s\n' "Status" "installed, NOT ACTIVE - run 'warp-manager snippets'"
   fi
   printf '%s\n' "------------------------------------------------------------------------"
 }
@@ -2193,6 +2261,8 @@ Commands:
   apply       Push generated snippets into the panel API (no reinstall)
   unapply     Remove WARP outbound/rules from the panel API
   fix-compose Re-detect and patch the NODE compose service for TUN access
+  snippets    Print the JSON to paste into Core Settings (no API needed)
+  mark-applied  Mark a manual Core Settings paste as done
   help        Show this help
 
 Install options:
@@ -2255,7 +2325,7 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied) COMMAND="$1"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -2346,6 +2416,8 @@ main() {
     apply)     require_root; cmd_apply apply ;;
     unapply)   require_root; cmd_apply remove ;;
     fix-compose) require_root; cmd_fix_compose ;;
+    snippets)  cmd_snippets ;;
+    mark-applied) require_root; cmd_mark_applied ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac

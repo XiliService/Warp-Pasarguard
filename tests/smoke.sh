@@ -533,6 +533,31 @@ check "panel_login does NOT switch panels without the flag" \
   bash -c '[[ "$1" == *"Skipping local panel"* && "$1" == *"Panel login failed"* ]]' _ "$login_out2"
 
 # ---------------------------------------------------------------------------
+printf '\n[8e] Manual-paste path (no API needed)\n'
+check "--help documents snippets" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'snippets    Print the JSON'"
+check "--help documents mark-applied" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'mark-applied  Mark a manual'"
+mkdir -p "$WORK/snip-app/outbound"
+printf '[{"tag":"warp","protocol":"wireguard"}]\n' > "$WORK/snip-app/outbound/outbounds.json"
+printf '[{"type":"field","outboundTag":"warp"}]\n' > "$WORK/snip-app/outbound/routing-rules.json"
+printf '[]\n' > "$WORK/snip-app/outbound/balancers.json"
+printf 'README\n' > "$WORK/snip-app/outbound/README.txt"
+snip_out="$(WARP_APP_DIR="$WORK/snip-app" bash "$ROOT/warp-manager.sh" snippets 2>&1 || true)"
+check "snippets prints the outbounds JSON verbatim" \
+  bash -c '[[ "$1" == *'"'"'"tag":"warp"'"'"'* ]]' _ "$snip_out"
+check "snippets tells the user to run mark-applied" \
+  bash -c '[[ "$1" == *"warp-manager mark-applied --yes"* ]]' _ "$snip_out"
+printf 'INSTALLED=1\nMODE=xray\nROUTING=domains\nPROFILES=default\n' > "$WORK/snip-app/state.env"
+WARP_APP_DIR="$WORK/snip-app" PATH="$WORK/bin:$PATH" \
+  bash "$ROOT/warp-manager.sh" mark-applied --yes >/dev/null 2>&1 || true
+check "mark-applied records the manual apply" \
+  grep -q 'PANEL_APPLY_METHOD=manual' "$WORK/snip-app/state.env"
+stat_out="$(WARP_APP_DIR="$WORK/snip-app" bash "$ROOT/warp-manager.sh" status 2>&1 || true)"
+check "status shows the config as applied (manual)" \
+  bash -c '[[ "$1" == *"Panel config applied (manual)"* ]]' _ "$stat_out"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \

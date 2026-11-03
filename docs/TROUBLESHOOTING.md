@@ -159,3 +159,25 @@ sudo warp-manager apply --panel-url https://panel.example.com \
 * If the real panel is on another server that this VPS cannot reach, paste
   the generated `outbounds.json` and `routing-rules.json` into Core Settings
   from your browser instead.
+
+---
+
+## Manual paste (works when the panel API is unreachable)
+
+An `HTTP 404` from `/api/admin/token` means the URL is not the panel API root
+- it is not a password problem. Stop using the API and paste the snippets:
+
+```bash
+sudo warp-manager snippets
+```
+
+1. Copy the objects from `outbounds.json` into the `outbounds` array of the
+   Core used by the **EXIT NODE**, after the existing first outbound.
+2. Copy the objects from `routing-rules.json` to the TOP of `routing.rules`.
+3. `balancers.json` is empty in single mode - nothing to paste.
+4. Save, then tell the manager the manual step is done:
+
+```bash
+sudo warp-manager mark-applied --yes
+sudo warp-manager status
+```

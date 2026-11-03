@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.5
+  PasarGuard WARP Manager  v1.0.6
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -491,3 +491,7 @@ See also [`docs/STEP-BY-STEP.md`](docs/STEP-BY-STEP.md) (complete beginner
 walkthrough), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md),
 [`docs/PANEL-CONFIG.md`](docs/PANEL-CONFIG.md) and
 [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md).
+
+When the panel API is not reachable at all, skip it: `warp-manager snippets`
+prints the exact JSON to paste into Core Settings, and
+`warp-manager mark-applied --yes` records that the manual step is done.
