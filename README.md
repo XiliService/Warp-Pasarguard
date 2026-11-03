@@ -114,7 +114,7 @@ One account per IP plus a spare account is a good pattern for busy panels.
 
 ```bash
 # One-line bootstrap (installs /usr/local/bin/warp-manager)
-curl -fsSL https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/main/install.sh | sudo bash
+curl -fsSL "https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/main/install.sh?v=$RANDOM" | sudo bash
 
 # Or from a local clone
 sudo ./install.sh
@@ -130,10 +130,17 @@ If `main` is not yet available (for example while working on a feature
 branch):
 
 ```bash
-curl -fsSL <install.sh-url> | sudo bash -s -- --branch arena/01417195-warp-pasarguard
+curl -fsSL "https://raw.githubusercontent.com/XiliService/Warp-Pasarguard/arena/01417195-warp-pasarguard/install.sh?v=$RANDOM" \
+  | sudo bash -s -- --branch arena/01417195-warp-pasarguard
 # or install fully offline from a clone:
 sudo ./install.sh --local ./warp-manager.sh --no-menu
 ```
+
+Append `?v=<anything>` to the URL after a push: `raw.githubusercontent.com`
+is CDN-cached for a few minutes, and the query string forces a fresh copy.
+The installer itself also adds a cache-buster when downloading
+`warp-manager.sh`. `install.sh` works both from a file and when streamed with
+`curl | bash -s` (where `BASH_SOURCE[0]` is unset).
 
 ---
 
@@ -141,7 +148,7 @@ sudo ./install.sh --local ./warp-manager.sh --no-menu
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.0
+  PasarGuard WARP Manager  v1.0.1
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown

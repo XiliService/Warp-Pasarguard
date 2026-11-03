@@ -19,8 +19,11 @@ readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly BRANCH_DEFAULT="main"
 readonly BRANCH_FALLBACK="arena/01417195-warp-pasarguard"
-readonly VERSION="1.0.0"
+readonly VERSION="1.0.1"
 
+# When this file is streamed with `curl | bash -s`, BASH_SOURCE[0] is unset.
+# Keep a safe, empty default so `set -u` never aborts the installer.
+SELF_PATH="${BASH_SOURCE[0]:-}"
 BRANCH="${WARP_BRANCH:-$BRANCH_DEFAULT}"
 APP_DIR="${WARP_APP_DIR:-/opt/pasarguard-warp}"
 BIN_LINK="${WARP_BIN_LINK:-/usr/local/bin/warp-manager}"
@@ -109,10 +112,13 @@ if [[ -n "$LOCAL_FILE" ]]; then
   cp -f -- "$LOCAL_FILE" "$TMP_FILE"
   SOURCE_USED="local:${LOCAL_FILE}"
 else
-  local_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || printf '.')"
+  local_dir="."
+  if [[ -n "$SELF_PATH" && -f "$SELF_PATH" ]]; then
+    local_dir="$(cd "$(dirname "$SELF_PATH")" 2>/dev/null && pwd || printf '.')"
+  fi
   local_candidate="$local_dir/warp-manager.sh"
   invoked_from_file=0
-  [[ -f "${BASH_SOURCE[0]}" && "${BASH_SOURCE[0]}" == *install.sh ]] && invoked_from_file=1
+  [[ -n "$SELF_PATH" && "$SELF_PATH" == *install.sh && -f "$SELF_PATH" ]] && invoked_from_file=1
   if [[ "$invoked_from_file" == "1" && -f "$local_candidate" ]]; then
     cp -f -- "$local_candidate" "$TMP_FILE"
     SOURCE_USED="local:${local_candidate}"
@@ -123,9 +129,10 @@ else
     else
       branches=("$BRANCH")
       [[ "$BRANCH" != "$BRANCH_FALLBACK" ]] && branches+=("$BRANCH_FALLBACK")
+      cache_bust="$(date +%s)"
       for b in "${branches[@]}"; do
-        urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh")
-        urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh")
+        urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh?v=${cache_bust}")
+        urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh?v=${cache_bust}")
       done
     fi
     for u in "${urls[@]}"; do

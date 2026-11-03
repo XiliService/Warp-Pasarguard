@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -1603,7 +1603,7 @@ update_url_for() {
 cmd_update() {
   state_init
   header "$APP_NAME v$SCRIPT_VERSION - Update Script"
-  local self="${BASH_SOURCE[0]}"
+  local self="${BASH_SOURCE[0]:-$0}"
   local tmp; tmp="$(mktemp)"
   local url branches=("$REPO_BRANCH")
   [[ "$REPO_BRANCH" != "$REPO_BRANCH_FALLBACK" ]] && branches+=("$REPO_BRANCH_FALLBACK")
@@ -1612,9 +1612,11 @@ cmd_update() {
   if [[ -n "$UPDATE_URL" ]]; then
     urls+=("$UPDATE_URL")
   else
+    local cache_bust
+    cache_bust="$(date +%s)"
     for b in "${branches[@]}"; do
-      urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh")
-      urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh")
+      urls+=("https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/${b}/warp-manager.sh?v=${cache_bust}")
+      urls+=("https://github.com/${REPO_OWNER}/${REPO_NAME}/raw/refs/heads/${b}/warp-manager.sh?v=${cache_bust}")
     done
   fi
   for url in "${urls[@]}"; do
@@ -1737,7 +1739,7 @@ cmd_status() {
   line
 
   header "Manager"
-  printf '  %-22s %s\n' "Script" "${BASH_SOURCE[0]}"
+  printf '  %-22s %s\n' "Script" "${BASH_SOURCE[0]:-$0}"
   printf '  %-22s %s\n' "State file" "$STATE_FILE"
   printf '  %-22s %s\n' "Installed" "$([[ "$installed" == "1" ]] && echo yes || echo no)"
   printf '  %-22s %s\n' "Backend" "$mode"
@@ -2034,6 +2036,6 @@ main() {
   esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if [[ "${BASH_SOURCE[0]:-$0}" == "$0" ]]; then
   main "$@"
 fi

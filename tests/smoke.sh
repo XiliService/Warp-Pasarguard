@@ -38,7 +38,7 @@ done
 
 # ---------------------------------------------------------------------------
 printf '\n[2] CLI surface\n'
-check "--version prints a version" bash -c "bash '$ROOT/warp-manager.sh' --version | grep -q '1.0.0'"
+check "--version prints a version" bash -c "bash '$ROOT/warp-manager.sh' --version | grep -qE '1\\.0\\.[0-9]+'"
 check "--help documents the five menu commands" bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'Status / health check'"
 check "install.sh --help works" bash -c "bash '$ROOT/install.sh' --help | grep -q 'bootstrap installer'"
 check "status runs without root" bash -c "WARP_APP_DIR='$WORK/ro-app' bash '$ROOT/warp-manager.sh' status 2>&1 | grep -q 'Overall health'"
@@ -58,6 +58,25 @@ printf '\n[3] Bootstrap installer (offline)\n'
 check "manager file installed" test -f "$WORK/bootstrap-app/warp-manager.sh"
 check "command symlink created" test -L "$WORK/bootstrap-bin/warp-manager"
 check "installed copy is executable" test -x "$WORK/bootstrap-app/warp-manager.sh"
+
+# ---------------------------------------------------------------------------
+printf '\n[3b] Piped installer (curl | bash -s, BASH_SOURCE is unset)\n'
+(
+  export WARP_APP_DIR="$WORK/pipe-app" WARP_BIN_LINK="$WORK/pipe-bin/warp-manager"
+  cat "$ROOT/install.sh" | bash -s -- --branch arena/01417195-warp-pasarguard \
+    --url "file://$ROOT/warp-manager.sh" --no-menu >"$WORK/pipe.log" 2>&1
+)
+check "piped installer exits without BASH_SOURCE errors" \
+  bash -c "! grep -q 'unbound variable' '$WORK/pipe.log'"
+check "piped installer installs the manager" test -f "$WORK/pipe-app/warp-manager.sh"
+check "piped installer creates the symlink" test -L "$WORK/pipe-bin/warp-manager"
+check "piped installer reports Done" grep -q 'Done' "$WORK/pipe.log"
+pipe_ver="$(cat "$ROOT/warp-manager.sh" | bash -s -- --version 2>&1)"
+if printf '%s' "$pipe_ver" | grep -q 'PasarGuard WARP Manager'; then
+  ok "manager itself runs from stdin"
+else
+  fail "manager itself runs from stdin"
+fi
 
 # ---------------------------------------------------------------------------
 printf '\n[4] Interactive menu (piped input)\n'
