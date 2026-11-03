@@ -1973,13 +1973,28 @@ create_api_key_via_db() {
     user="$(jq -r '.[]? | select(startswith("POSTGRES_USER=")) | ltrimstr("POSTGRES_USER=")' <<<"$env_json" | head -n1)"
     pass="$(jq -r '.[]? | select(startswith("POSTGRES_PASSWORD=")) | ltrimstr("POSTGRES_PASSWORD=")' <<<"$env_json" | head -n1)"
     dbname="$(jq -r '.[]? | select(startswith("POSTGRES_DB=")) | ltrimstr("POSTGRES_DB=")' <<<"$env_json" | head -n1)"
+  else
+    user="$(grep -o 'POSTGRES_USER=[^"]*' <<<"$env_json" | head -n1 | cut -d= -f2-)"
+    pass="$(grep -o 'POSTGRES_PASSWORD=[^"]*' <<<"$env_json" | head -n1 | cut -d= -f2-)"
+    dbname="$(grep -o 'POSTGRES_DB=[^"]*' <<<"$env_json" | head -n1 | cut -d= -f2-)"
   fi
-  [[ -n "$user" ]] || user="postgres"
-  [[ -n "$dbname" ]] || dbname="pasarguard"
+  user="${user:-postgres}"; pass="${pass:-}"; dbname="${dbname:-pasarguard}"
 
-  admin_id="$(docker exec -e PGPASSWORD="$pass" "$dbc" psql -U "$user" -d "$dbname" -tAc \
-      'SELECT id FROM admins ORDER BY id LIMIT 1' 2>/dev/null | tr -d '[:space:]')"
-  if [[ ! "$admin_id" =~ ^[0-9]+$ ]]; then return 1; fi
+  # The panel may use a different database name than POSTGRES_DB. Probe a few
+  # candidates and require both the admins and api_keys tables to be present.
+  admin_id=""; local candidate db_ok=""
+  for candidate in "$dbname" postgres pasarguard pasarguard_db panel "$user"; do
+    [[ -n "$candidate" ]] || continue
+    admin_id="$(docker exec -e PGPASSWORD="$pass" "$dbc" psql -U "$user" -d "$candidate" \
+        -tAc 'SELECT id FROM admins ORDER BY id LIMIT 1' 2>/dev/null | tr -d '[:space:]')"
+    [[ "$admin_id" =~ ^[0-9]+$ ]] || continue
+    if docker exec -e PGPASSWORD="$pass" "$dbc" psql -U "$user" -d "$candidate" \
+        -tAc 'SELECT 1 FROM api_keys LIMIT 1' >/dev/null 2>&1; then
+      db_ok="$candidate"; break
+    fi
+  done
+  if [[ -z "$db_ok" ]]; then return 1; fi
+  local dbname="$db_ok"
 
   uuid="$(python3 -c 'import uuid; print(uuid.uuid4())')" || return 1
   local -a parts=()
@@ -2005,7 +2020,7 @@ INSERT INTO api_keys (admin_id, name, key_hash, api_key_trimmed, permissions, in
 VALUES (${admin_id}, '${PANEL_KEY_NAME}', '${lookup}', '${trimmed}', '{}'::jsonb, TRUE, 'Created by WARP Manager; reused across versions', 'active', NOW());
 COMMIT;"
   if ! printf '%s\n' "$sql" | docker exec -i -e PGPASSWORD="$pass" "$dbc" \
-       psql -U "$user" -d "$dbname" -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
+       psql -U "$user" -d "$db_ok" -v ON_ERROR_STOP=1 -q >/dev/null 2>&1; then
     return 1
   fi
   printf '%s' "$raw"
