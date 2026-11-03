@@ -157,7 +157,7 @@ unset).
 
 ```
 ========================================================================
-  PasarGuard WARP Manager  v1.0.7
+  PasarGuard WARP Manager  v1.0.8
 ========================================================================
   Host             ...
   Role             node | panel | panel+node | unknown
@@ -523,3 +523,46 @@ first endpoint that returns a valid `/api/cores` response. The key is stored in
   WARP domains rule must be ABOVE catch-all inbound rules such as
   `Germany -> Out-DE`; otherwise those rules win and WARP is never used.
   Leading `BLOCK`/security rules stay above the WARP rule.
+
+---
+
+## Full backup (automatic before every install / remove)
+
+`warp-manager install` and `warp-manager remove` take a full snapshot first,
+so a mistake is always reversible:
+
+```bash
+sudo warp-manager backup                       # take one explicitly
+sudo warp-manager restore /opt/pasarguard-warp/backups/full-...   # files
+```
+
+Each backup contains:
+
+* panel files (`/opt/pasarguard`, `/var/lib/pasarguard`, `.env`, certs),
+* node directories (`/opt/out-node`, `/opt/main-node`, `/var/lib/pg-node`),
+* `/etc/wireguard` and `/opt/pasarguard-warp` (profiles, keys, snippets),
+* a **database dump** via `pg_dumpall` (or `pg_dump` / SQLite copy),
+* resolved `docker compose config` output for every node,
+* every Core configuration as JSON (when an API key is available),
+* `MANIFEST.txt`, `RESTORE.md` and a standalone `restore.sh`.
+
+`RESTORE.md` contains the exact `psql` command for the database step.
+Backups are **never deleted** by `remove`, and the manager script is kept so
+`restore` stays available after a full uninstall.
+
+## Dedicated API key (created once, reused forever)
+
+```bash
+sudo warp-manager key
+```
+
+The manager asks for the admin username/password **once**, gets a session,
+creates a key named `warp-manager` with inherited permissions via
+`POST /api/api_key`, and stores the raw `pg_key_...` in `state.env` (0600).
+On every later install/apply/update it verifies that key with a read-only
+`GET /api/cores` and reuses it. Only if the key is missing or invalid does it
+create a new one (stale dedicated keys are removed first).
+
+You can skip the credentials entirely by passing an existing key:
+`--panel-key pg_key_...`. Env admins (`SUDO_USERNAME`) cannot create API keys;
+use a real owner/admin account or provide the key manually.

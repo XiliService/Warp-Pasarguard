@@ -78,7 +78,7 @@ What the command means:
 Expected output:
 
 ```
-  PasarGuard WARP Manager - Bootstrap Installer v1.0.7
+  PasarGuard WARP Manager - Bootstrap Installer v1.0.8
 ==> Trying https://api.github.com/repos/.../contents/warp-manager.sh?ref=...
 ==> Installed: /opt/pasarguard-warp/warp-manager.sh
 ==> Command  : /usr/local/bin/warp-manager
@@ -92,7 +92,7 @@ Verify the installation:
 
 ```bash
 which warp-manager
-warp-manager --version          # PasarGuard WARP Manager 1.0.7
+warp-manager --version          # PasarGuard WARP Manager 1.0.8
 ls -l /usr/local/bin/warp-manager
 ```
 
@@ -395,3 +395,25 @@ pasted them manually (the API path removes them automatically).
 Backups of every modified file live in `/opt/pasarguard-warp/backups/`.
 WARP private keys live in `/opt/pasarguard-warp/profiles/` with mode 0600 -
 never share those files.
+
+---
+
+## Backup and rollback
+
+A full backup (files + database + Core configs) is taken automatically before
+every `install` and every `remove`. To take one manually:
+
+```bash
+sudo warp-manager backup
+sudo warp-manager status          # shows the last backup path
+```
+
+To roll back files: `sudo warp-manager restore <backup-dir>` (see
+`RESTORE.md` inside the backup for the database step). Backups are never
+removed by `remove`.
+
+## API key lifecycle
+
+`sudo warp-manager key` creates a dedicated `warp-manager` API key once and
+reuses it in all future versions. The install wizard asks for the admin
+username/password only the first time; the password is never stored.

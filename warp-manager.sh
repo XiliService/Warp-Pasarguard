@@ -16,7 +16,7 @@ umask 022
 # Constants
 # -----------------------------------------------------------------------------
 readonly APP_NAME="PasarGuard WARP Manager"
-readonly SCRIPT_VERSION="1.0.7"
+readonly SCRIPT_VERSION="1.0.8"
 readonly REPO_OWNER="XiliService"
 readonly REPO_NAME="Warp-Pasarguard"
 readonly REPO_BRANCH_DEFAULT="main"
@@ -73,6 +73,8 @@ PANEL_USER="${PANEL_USER:-}"
 PANEL_PASS="${PANEL_PASS:-}"
 PANEL_API_KEY="${PANEL_API_KEY:-}"
 PANEL_AUTH_MODE="token"
+PANEL_KEY_NAME="warp-manager"
+RESTORE_DB="0"; AUTO_KEY="0"; RESTORE_PATH=""
 PANEL_TOKEN="${PANEL_TOKEN:-}"
 PANEL_CORE_ID="${PANEL_CORE_ID:-}"
 APPLY_PANEL="${WARP_APPLY_PANEL:-auto}"
@@ -1775,7 +1777,7 @@ choose_optional() {
     return 0
   fi
   if [[ -n "$PANEL_URL" && -z "$PANEL_USER" ]]; then
-    ans="$(ui_read "Panel admin username (Enter to skip manual API login): ")" || return 1
+    ans="$(ui_read "Panel admin username (used ONCE to create a dedicated API key; Enter to skip): ")" || return 1
     PANEL_USER="$ans"
     if [[ -n "$PANEL_USER" ]]; then
       ans="$(ui_read_secret "Panel admin password: ")" || return 1
@@ -1824,6 +1826,7 @@ cmd_install() {
   fi
 
   print_target_guidance
+  load_saved_api_key
 
   if [[ "$ASSUME_YES" == "1" || "$DRY_RUN" == "1" || ! -r /dev/tty ]]; then
     apply_defaults
@@ -1838,6 +1841,12 @@ cmd_install() {
 
   if [[ "$BINDING" == "per-ip" ]]; then
     normalize_perip
+  fi
+
+  if [[ "$APPLY_PANEL" != "no" && -z "$PANEL_API_KEY" && -n "$PANEL_USER" && -n "$PANEL_PASS" ]]; then
+    if ! ensure_api_key; then
+      warn "Continuing without an API key; snippets will be written for manual paste."
+    fi
   fi
 
   local -a names=() srcs=() eps=()
@@ -1868,6 +1877,13 @@ cmd_install() {
   if [[ "$DRY_RUN" == "1" ]]; then
     info "Dry-run complete. No changes were made."
     return 0
+  fi
+
+  local pre_install_backup
+  pre_install_backup="$(make_full_backup pre-install)" || warn "Could not take a full backup; continuing anyway."
+  if [[ -n "$pre_install_backup" ]]; then
+    ok "Full backup taken before install: ${pre_install_backup}"
+    ok "Restore with: warp-manager restore ${pre_install_backup}"
   fi
 
   install_packages
@@ -1913,6 +1929,92 @@ TXT
   header "Installation complete"
   info "Run 'warp-manager status' to verify the health of the deployment."
   info "Run 'warp-manager logs' to inspect service output."
+}
+
+# -----------------------------------------------------------------------------
+# Dedicated API key: create ONCE, verify and reuse across all versions
+# -----------------------------------------------------------------------------
+ensure_api_key() {
+  load_saved_api_key
+  if [[ -n "$PANEL_API_KEY" ]]; then
+    if panel_login >/dev/null 2>&1; then
+      info "Reusing the existing dedicated API key '${PANEL_KEY_NAME}'."
+      return 0
+    fi
+    warn "Stored API key is no longer valid; creating a new one."
+  fi
+
+  if [[ -z "$PANEL_USER" ]]; then
+    PANEL_USER="$(ui_read "Panel admin username (used ONCE to create a dedicated API key): ")" || return 1
+  fi
+  if [[ -z "$PANEL_PASS" ]]; then
+    PANEL_PASS="$(ui_read_secret "Panel admin password (used once, never stored): ")" || return 1
+  fi
+  if [[ -z "$PANEL_USER" || -z "$PANEL_PASS" ]]; then
+    error "Admin credentials are needed once to create an API key."
+    warn "Or create a key in Panel -> API Keys and pass --panel-key pg_key_... ."
+    return 1
+  fi
+
+  local stale="$PANEL_API_KEY" saved_allow="$ALLOW_LOCAL_PANEL"
+  PANEL_API_KEY=""
+  PANEL_AUTH_MODE="token"
+  ALLOW_LOCAL_PANEL="1"
+  if ! panel_login >/dev/null 2>&1; then
+    ALLOW_LOCAL_PANEL="$saved_allow"
+    PANEL_API_KEY="$stale"
+    error "Could not get an admin session (check username/password and panel URL)."
+    warn "Tip: --panel-url must point at the real panel API root, not a proxy domain."
+    return 1
+  fi
+  ALLOW_LOCAL_PANEL="$saved_allow"
+
+  # A previously created key cannot be recovered from the list (only a trimmed
+  # value is returned), so remove stale dedicated keys before minting one.
+  if panel_api GET "/api_keys?name=${PANEL_KEY_NAME}" >/dev/null 2>&1; then
+    local ids
+    ids="$(jq -c '[.api_keys[]?.id]' <<<"$PANEL_API_BODY" 2>/dev/null || echo '[]')"
+    if [[ "$ids" != "[]" ]]; then
+      panel_api POST "/api_keys/bulk/delete" "{\"ids\":${ids}}" >/dev/null 2>&1 || true
+      info "Removed ${ids} stale dedicated key id(s)."
+    fi
+  fi
+
+  local payload
+  payload="$(jq -n --arg n "$PANEL_KEY_NAME" \
+      '{name: $n, note: "Created by WARP Manager; reused across all versions", inherit_permissions: true}')"
+  if ! panel_api POST "/api_key" "$payload"; then
+    PANEL_API_KEY="$stale"
+    error "Could not create the API key (needs api_keys:create, or an owner admin)."
+    warn "Env admins (SUDO_USERNAME) cannot create keys; use a real owner account."
+    return 1
+  fi
+  local key
+  key="$(jq -r '.api_key // empty' <<<"$PANEL_API_BODY" 2>/dev/null || true)"
+  if [[ -z "$key" ]]; then
+    PANEL_API_KEY="$stale"
+    error "Panel did not return the raw API key."
+    return 1
+  fi
+  PANEL_API_KEY="$key"
+  PANEL_AUTH_MODE="api-key"
+  PANEL_ACCESS_TOKEN="$key"
+  state_set PANEL_API_KEY "$key"
+  state_set PANEL_KEY_NAME "$PANEL_KEY_NAME"
+  ok "Created dedicated API key '${PANEL_KEY_NAME}' and saved it for all future runs."
+  return 0
+}
+
+cmd_key() {
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - API Key"
+  load_saved_api_key
+  if ensure_api_key; then
+    info "Key name: ${PANEL_KEY_NAME}"
+    info "Stored at: ${STATE_FILE} (0600). Shared by every version of this script."
+    return 0
+  fi
+  return 1
 }
 
 cmd_snippets() {
@@ -1966,6 +2068,9 @@ cmd_apply() {
   state_init
   load_saved_api_key
   header "$APP_NAME v$SCRIPT_VERSION - Apply Panel Config (${action})"
+  if [[ "$AUTO_KEY" == "1" || ( -z "$PANEL_API_KEY" && -n "$PANEL_USER" && -n "$PANEL_PASS" ) ]]; then
+    ensure_api_key || die "Could not create/verify a dedicated API key."
+  fi
   have jq || die "jq is required for panel API integration."
   if [[ -z "$PANEL_URL" && -z "$PANEL_API_KEY" ]]; then
     die "Provide --panel-key KEY (recommended), or --panel-url URL with admin credentials."
@@ -1997,10 +2102,207 @@ cmd_apply() {
 }
 
 # -----------------------------------------------------------------------------
+# Full backup (panel files + database + compose + core configs)
+# -----------------------------------------------------------------------------
+backup_target_dirs() {
+  local d f
+  local -a dirs=()
+  for d in "$APP_DIR" /opt/pasarguard /var/lib/pasarguard /opt/pasarguard-warp \
+           /opt/pg-node /var/lib/pg-node /etc/wireguard \
+           /opt/out-node /opt/main-node; do
+    [[ -d "$d" ]] && dirs+=("$d")
+  done
+  while IFS='|' read -r f _ _; do
+    d="$(dirname "$f" 2>/dev/null || true)"
+    [[ -n "$d" && -d "$d" ]] && dirs+=("$d")
+  done < <(node_compose_targets)
+  if (( ${#dirs[@]} > 0 )); then printf '%s\n' "${dirs[@]}" | awk '!seen[$0]++'; fi
+  return 0
+}
+
+# Prints ONLY the backup directory on stdout. All progress goes to stderr.
+make_full_backup() {
+  local label="${1:-manual}" tag dest
+  tag="$(now_tag)"
+  dest="$BACKUP_DIR/full-${tag}-${label}"
+  mkdir -p "$dest/files" "$dest/db" "$dest/compose" "$dest/cores" || return 1
+
+  local d name
+  while IFS= read -r d; do
+    [[ -d "$d" ]] || continue
+    name="$(printf '%s' "${d#/}" | tr '/' '_')"
+    if tar czf "$dest/files/${name}.tar.gz" -C "$(dirname "$d")" \
+        --exclude="$(basename "$d")/logs" \
+        --exclude="$(basename "$d")/backups/full-*" \
+        "$(basename "$d")" >/dev/null 2>&1; then
+      info "  Files: ${d}" >&2
+    else
+      warn "  Could not archive ${d}" >&2
+    fi
+  done < <(backup_target_dirs)
+
+  local dbc env_json user pass dbname pc url cand
+  if have docker; then
+    dbc="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+          | awk '$2 ~ /timescale|postgres/ {print $1; exit}')"
+    if [[ -n "$dbc" ]] && have jq; then
+      env_json="$(docker inspect "$dbc" --format '{{json .Config.Env}}' 2>/dev/null || true)"
+      user="$(jq -r '.[]? | select(startswith("POSTGRES_USER=")) | ltrimstr("POSTGRES_USER=")' <<<"$env_json" | head -n1)"
+      pass="$(jq -r '.[]? | select(startswith("POSTGRES_PASSWORD=")) | ltrimstr("POSTGRES_PASSWORD=")' <<<"$env_json" | head -n1)"
+      dbname="$(jq -r '.[]? | select(startswith("POSTGRES_DB=")) | ltrimstr("POSTGRES_DB=")' <<<"$env_json" | head -n1)"
+      [[ -n "$user" ]] || user="postgres"
+      [[ -n "$dbname" ]] || dbname="pasarguard"
+      if docker exec -e PGPASSWORD="$pass" "$dbc" pg_dumpall -U "$user" \
+           >"$dest/db/pg_dumpall.sql" 2>/dev/null; then
+        info "  Database: pg_dumpall from ${dbc}" >&2
+        printf '%s\n' "$dbc" > "$dest/db/container.txt"
+      elif docker exec -e PGPASSWORD="$pass" "$dbc" pg_dump -U "$user" -d "$dbname" \
+           >"$dest/db/pg_dump.sql" 2>/dev/null; then
+        info "  Database: pg_dump from ${dbc}" >&2
+        printf '%s\n' "$dbc" > "$dest/db/container.txt"
+      else
+        warn "  PostgreSQL dump failed - copy the DB volume manually." >&2
+      fi
+      printf '%s\n' "$user" > "$dest/db/user.txt"
+      printf '%s\n' "$dbname" > "$dest/db/name.txt"
+      chmod 600 "$dest/db/container.txt" "$dest/db/user.txt" "$dest/db/name.txt" 2>/dev/null || true
+    fi
+    pc="$(docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null \
+         | awk '$2 ~ /pasarguard\/panel/ {print $1; exit}')"
+    if [[ -n "$pc" ]]; then
+      url="$(docker inspect "$pc" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null \
+            | grep '^SQLALCHEMY_DATABASE_URL=sqlite' | head -n1 | cut -d= -f2- || true)"
+      if [[ -n "$url" ]]; then
+        cand="${url#*///}"
+        for cand in "$cand" "/app/$cand" "/opt/pasarguard/$cand"; do
+          if docker cp "$pc:$cand" "$dest/db/db.sqlite3" >/dev/null 2>&1; then
+            info "  Database: SQLite copy" >&2
+            break
+          fi
+        done
+      fi
+    fi
+  fi
+
+  local cf
+  while IFS='|' read -r cf _ _; do
+    [[ -f "$cf" ]] || continue
+    ( cd "$(dirname "$cf")" && docker compose -f "$(basename "$cf")" config ) \
+      >"$dest/compose/$(basename "$(dirname "$cf")").yml" 2>/dev/null || true
+  done < <(node_compose_targets)
+
+  # Application-level core configs (best effort, needs an API key).
+  if [[ -n "$PANEL_API_KEY" ]] && have jq; then
+    local saved_mode="$PANEL_AUTH_MODE" saved_token="$PANEL_ACCESS_TOKEN"
+    if panel_login >/dev/null 2>&1 && panel_api GET "/cores" >/dev/null 2>&1; then
+      local list="$PANEL_API_BODY" id
+      while IFS= read -r id; do
+        [[ -n "$id" ]] || continue
+        if panel_api GET "/core/${id}" >/dev/null 2>&1; then
+          printf '%s\n' "$PANEL_API_BODY" | jq . >"$dest/cores/core-${id}.json" 2>/dev/null || true
+        fi
+      done < <(jq -r '.cores[]?.id' <<<"$list" 2>/dev/null)
+      info "  Panel core configs saved as JSON" >&2
+    fi
+    PANEL_AUTH_MODE="$saved_mode"; PANEL_ACCESS_TOKEN="$saved_token"
+  fi
+
+  {
+    printf 'PasarGuard WARP Manager - full backup manifest\n'
+    printf 'Created:   %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    printf 'Host:      %s\n' "$(hostname 2>/dev/null || echo unknown)"
+    printf 'Version:   %s\n' "$SCRIPT_VERSION"
+    printf 'Label:     %s\n' "$label"
+    printf 'Contains:  panel/node files, PostgreSQL or SQLite dump, compose configs, core JSON\n'
+  } >"$dest/MANIFEST.txt"
+
+  cat >"$dest/RESTORE.md" <<'TXT'
+# Restoring this backup
+
+STOP the panel before restoring the database:
+
+    cd /opt/pasarguard && docker compose down
+
+1) Restore files (compose, .env, certs, node dirs, WARP profiles):
+
+    warp-manager restore /PATH/TO/THIS/DIRECTORY
+    # If the manager command was uninstalled, this is equivalent:
+    bash /PATH/TO/THIS/DIRECTORY/restore.sh
+
+2) Restore the database (pick the file that exists in db/):
+
+    docker compose -f /opt/pasarguard/docker-compose.yml up -d <db-service>
+    cat db/pg_dumpall.sql | docker exec -i <db-container> psql -U <user>
+    # or, for a single-database dump:
+    cat db/pg_dump.sql | docker exec -i <db-container> psql -U <user> -d <dbname>
+    # or, for SQLite: docker cp db/db.sqlite3 <panel-container>:/app/db.sqlite3
+
+3) Recreate containers:
+
+    cd /opt/pasarguard && docker compose up -d
+    cd /opt/out-node  && docker compose up -d   # repeat for every node
+
+Core Settings are also saved individually in cores/core-<id>.json and in
+/opt/pasarguard-warp/backups/panel-core-<id>-*.json - they can be pasted back
+into the panel UI if only the Core config needs rolling back.
+TXT
+
+  cat >"$dest/restore.sh" <<'EOF'
+#!/usr/bin/env bash
+# Generated by warp-manager. Review before running.
+set -euo pipefail
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+for f in "$SRC"/files/*.tar.gz; do
+  [[ -f "$f" ]] || continue
+  echo "Restoring $f"
+  tar xzf "$f" -C /
+done
+echo "Files restored. See RESTORE.md for the database steps."
+EOF
+  chmod 700 "$dest/restore.sh"
+  chmod 600 "$dest"/db/* 2>/dev/null || true
+  printf '%s' "$dest"
+  return 0
+}
+
+cmd_backup() {
+  state_init
+  load_saved_api_key
+  header "$APP_NAME v$SCRIPT_VERSION - Full Backup"
+  local dest
+  dest="$(make_full_backup "${BACKUP_LABEL:-manual}")" || die "Backup failed."
+  ok "Full backup saved: ${dest}"
+  info "Size: $(du -sh "$dest" 2>/dev/null | awk '{print $1}')"
+  info "Restore: warp-manager restore ${dest}"
+  return 0
+}
+
+cmd_restore() {
+  local src="${1:-}"
+  [[ -n "$src" && -d "$src" ]] || die "Usage: warp-manager restore /opt/pasarguard-warp/backups/full-..."
+  state_init
+  header "$APP_NAME v$SCRIPT_VERSION - Restore"
+  warn "This OVERWRITES panel/node/WARP files. Stop the panel containers first."
+  cat "$src/MANIFEST.txt" 2>/dev/null || true
+  if ! confirm "Restore files from this backup?"; then warn "Cancelled."; return 0; fi
+  local f
+  for f in "$src"/files/*.tar.gz; do
+    [[ -f "$f" ]] || continue
+    if tar xzf "$f" -C /; then ok "Restored $(basename "$f")"; else warn "Failed: $(basename "$f")"; fi
+  done
+  if [[ -f "$src/db/pg_dumpall.sql" || -f "$src/db/pg_dump.sql" || -f "$src/db/db.sqlite3" ]]; then
+    warn "The database was NOT restored automatically. See ${src}/RESTORE.md."
+  fi
+  ok "File restore complete. Restart the panel with: cd /opt/pasarguard && docker compose up -d"
+  return 0
+}
+
+# -----------------------------------------------------------------------------
 # Remove
 # -----------------------------------------------------------------------------
 cmd_remove() {
   state_init
+  load_saved_api_key
   detect_os; detect_role; detect_ips
   header "$APP_NAME v$SCRIPT_VERSION - Remove / Uninstall"
   if ! is_installed; then
@@ -2022,14 +2324,23 @@ cmd_remove() {
   printf '  %-22s %s\n' "Generated files" "$OUTPUT_DIR"
   line
   cat <<'TXT'
-  This stops WARP interfaces / removes config files created by this tool.
-  It does NOT automatically delete outbound objects and routing rules that
-  you pasted into the panel. Remove those from Core Settings afterwards, or
-  use the optional panel API cleanup below.
+  This stops WARP interfaces / removes config files created by this tool,
+  deletes the WARP account, and rolls back the /dev/net/tun compose patch.
+  Panel Core Settings are cleaned automatically ONLY when a working API key
+  is available. Otherwise remove the WARP outbound/rules manually in the
+  panel UI BEFORE reinstalling, or duplicates will appear.
+  A full backup (files + database) is taken automatically first.
 TXT
   line
   if ! confirm "Continue with removal?"; then warn "Cancelled."; return 0; fi
   [[ "$DRY_RUN" == "1" ]] && { info "Dry-run complete. No changes were made."; return 0; }
+
+  local pre_remove_backup
+  pre_remove_backup="$(make_full_backup pre-remove)" || warn "Could not take a full backup; continuing anyway."
+  if [[ -n "$pre_remove_backup" ]]; then
+    ok "Full backup taken before removal: ${pre_remove_backup}"
+    ok "Restore with: warp-manager restore ${pre_remove_backup}"
+  fi
 
   if [[ "$mode" == "kernel" && ${#arr[@]} -gt 0 ]]; then
     rollback_kernel "${arr[@]}"
@@ -2044,7 +2355,7 @@ TXT
 
   restore_compose
 
-  if [[ "$APPLY_PANEL" != "no" && -n "$PANEL_URL" ]]; then
+  if [[ "$APPLY_PANEL" != "no" && ( -n "$PANEL_URL" || -n "$PANEL_API_KEY" ) ]]; then
     [[ -d "$OUTPUT_DIR" ]] || mkdir -p "$OUTPUT_DIR"
     [[ -f "$OUTPUT_DIR/outbounds.json" ]] || printf '[]\n' >"$OUTPUT_DIR/outbounds.json"
     [[ -f "$OUTPUT_DIR/routing-rules.json" ]] || printf '[]\n' >"$OUTPUT_DIR/routing-rules.json"
@@ -2064,10 +2375,18 @@ TXT
   state_set_many "INSTALLED=0" "REMOVED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "PROFILES="
   ok "WARP removed."
 
-  if confirm "Also uninstall the manager command and all logs/backups?"; then
+  if confirm "Also uninstall the manager command and logs? (backups are ALWAYS kept)"; then
     rm -f -- "$BIN_LINK"
-    rm -rf -- "$APP_DIR"
-    ok "Manager fully uninstalled."
+    local x
+    for x in "$APP_DIR"/* "$APP_DIR"/.[!.]*; do
+      [[ -e "$x" ]] || continue
+      case "$(basename "$x")" in
+        backups|warp-manager.sh) continue ;;
+      esac
+      rm -rf -- "$x"
+    done
+    ok "Manager command removed. Backups and the script remain in ${APP_DIR}."
+    ok "Restore any time with: bash ${APP_DIR}/warp-manager.sh restore <backup-dir>"
   else
     info "Manager kept. Reinstall any time with 'warp-manager install'."
   fi
@@ -2318,7 +2637,10 @@ cmd_status() {
   if [[ "$installed" == "1" && "$(state_get PANEL_LAST_APPLY never)" == "never" ]]; then
     header "Next step"
     info "  Recommended: create an API key in Panel -> API Keys, then:"
-    info "     warp-manager apply --panel-key pg_key_... --yes"
+    info "     warp-manager backup
+  warp-manager key
+  warp-manager apply --panel-key pg_key_... --yes
+  warp-manager apply --panel-user admin --panel-pass 'secret' --yes"
     info "     (It fixes outbound/rule order automatically; URL is auto-detected.)"
     info "  Without an API key: warp-manager snippets, paste into Core Settings,"
     info "     Save, then warp-manager mark-applied --yes"
@@ -2400,6 +2722,9 @@ Commands:
   fix-compose Re-detect and patch the NODE compose service for TUN access
   snippets    Print the JSON to paste into Core Settings (no API needed)
   mark-applied  Mark a manual Core Settings paste as done
+  backup      Full backup: panel/node files, database, compose, core configs
+  restore DIR Restore files from a full backup (DB steps in RESTORE.md)
+  key         Create/reuse the dedicated Panel API key
   help        Show this help
 
 Install options:
@@ -2422,6 +2747,9 @@ Panel API options (optional):
   --panel-user USER         Admin username
   --panel-pass PASS         Admin password
   --panel-key KEY           Panel API key (pg_key_...); preferred, no login needed
+  --auto-key                Create/reuse the dedicated API key automatically
+  --backup-label NAME       Label for a 'backup' run
+  --from DIR                Backup directory for 'restore' (or pass it directly)
   --panel-token TOKEN       Bearer token instead of username/password
   --core-id ID              Core configuration ID to modify
   --apply-panel             Force API apply
@@ -2464,7 +2792,7 @@ EOF
 parse_args() {
   while (( $# > 0 )); do
     case "$1" in
-      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied) COMMAND="$1"; shift ;;
+      install|remove|update|logs|status|menu|help|apply|unapply|fix-compose|snippets|mark-applied|backup|restore|key) COMMAND="$1"; shift ;;
       --mode) MODE="$2"; shift 2 ;;
       --target) TARGET="$2"; shift 2 ;;
       --binding) BINDING="$2"; BINDING_PRESET=1; shift 2 ;;
@@ -2482,6 +2810,10 @@ parse_args() {
       --panel-pass) PANEL_PASS="$2"; shift 2 ;;
       --panel-token) PANEL_TOKEN="$2"; shift 2 ;;
       --panel-key) PANEL_API_KEY="$2"; shift 2 ;;
+      --backup-label) BACKUP_LABEL="$2"; shift 2 ;;
+      --auto-key) AUTO_KEY=1; shift ;;
+      --restore-db) RESTORE_DB=1; shift ;;
+      --from) RESTORE_PATH="$2"; shift 2 ;;
       --core-id) PANEL_CORE_ID="$2"; shift 2 ;;
       --apply-panel) APPLY_PANEL="yes"; shift ;;
       --no-apply-panel) APPLY_PANEL="no"; shift ;;
@@ -2497,6 +2829,7 @@ parse_args() {
       --follow) LOG_FOLLOW=1; shift ;;
       --version|-V) printf '%s %s\n' "$APP_NAME" "$SCRIPT_VERSION"; exit 0 ;;
       --help|-h|help) usage; exit 0 ;;
+      /*|./*|../*) RESTORE_PATH="$1"; shift ;;
       *) die "Unknown option: $1 (use --help)"; ;;
     esac
   done
@@ -2558,6 +2891,9 @@ main() {
     fix-compose) require_root; cmd_fix_compose ;;
     snippets)  cmd_snippets ;;
     mark-applied) require_root; cmd_mark_applied ;;
+    backup)    require_root; cmd_backup ;;
+    restore)   require_root; cmd_restore "${RESTORE_PATH:-}" ;;
+    key)       require_root; cmd_key ;;
     help)      usage ;;
     *)         die "Unknown command: ${COMMAND}" ;;
   esac

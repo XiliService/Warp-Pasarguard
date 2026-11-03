@@ -196,3 +196,13 @@ they match first and the WARP domains rule at the bottom is never reached.
 
 `warp-manager apply --panel-key pg_key_... --yes` rewrites both lists in the
 correct order automatically and backs up the core config first.
+
+---
+
+## Need to roll back?
+
+Every `install` and `remove` writes a full backup under
+`/opt/pasarguard-warp/backups/full-*/`. Run
+`warp-manager restore <dir>` for files and follow `RESTORE.md` for the
+PostgreSQL/SQLite dump. Core Settings are also saved individually as
+`panel-core-<id>-*.json` before every API apply.

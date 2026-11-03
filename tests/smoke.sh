@@ -678,6 +678,121 @@ check "install wizard asks for and stores the API key" \
   bash -c '[[ "$1" == *"KEY=pg_key_test"* && "$1" == *"APPLY=yes"* ]]' _ "$key_wiz"
 
 # ---------------------------------------------------------------------------
+printf '\n[8h] Full backup, restore and smart API key lifecycle\n'
+check "--help documents backup" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'backup      Full backup'"
+check "--help documents restore and key" \
+  bash -c "bash '$ROOT/warp-manager.sh' --help | grep -q 'key         Create/reuse'"
+mkdir -p "$WORK/fakebin6" "$WORK/bk-app/outbound"
+printf 'STATE=1\n' > "$WORK/bk-app/state.env"
+printf '{}' > "$WORK/bk-app/outbound/outbounds.json"
+cat >"$WORK/fakebin6/docker" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  ps)
+    if [[ "${2:-}" == "--format" ]]; then
+      printf 'pasarguard-timescaledb-1 timescale/timescaledb:2.30.0-pg17\n'
+      printf 'pasarguard-pasarguard-1 pasarguard/panel:latest\n'
+      printf 'out-node pasarguard/node:latest\n'
+    fi
+    exit 0 ;;
+  inspect)
+    fmt="$4"
+    case "$fmt" in
+      *Config.Env*json*) printf '["POSTGRES_USER=pguser","POSTGRES_PASSWORD=pgpass","POSTGRES_DB=pgdb"]\n' ;;
+      *Config.Env*println*) printf 'SQLALCHEMY_DATABASE_URL=postgresql+asyncpg://x\n' ;;
+      *Config.Image*) printf 'timescale/timescaledb:latest\n' ;;
+      *) printf '\n' ;;
+    esac
+    exit 0 ;;
+  exec)
+    printf -- '-- full database dump\nCREATE TABLE dummy(id int);\n'
+    exit 0 ;;
+  compose) printf 'services: {}\n'; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$WORK/fakebin6/docker"
+bk_dir="$(WARP_APP_DIR="$WORK/bk-app" PATH="$WORK/fakebin6:$PATH" \
+  bash -c 'source "'"$ROOT"'/warp-manager.sh"; make_full_backup test' 2>/dev/null || true)"
+check "backup creates a MANIFEST and RESTORE.md" \
+  bash -c '[[ -f "$1/MANIFEST.txt" && -f "$1/RESTORE.md" && -f "$1/restore.sh" ]]' _ "$bk_dir"
+check "backup archives the WARP app directory" \
+  bash -c 'ls "$1"/files/*.tar.gz >/dev/null 2>&1' _ "$bk_dir"
+check "backup includes a PostgreSQL dump" \
+  bash -c '[[ -s "$1/db/pg_dumpall.sql" ]]' _ "$bk_dir"
+check "backup records the DB container name" \
+  bash -c '[[ "$(cat "$1/db/container.txt")" == "pasarguard-timescaledb-1" ]]' _ "$bk_dir"
+# restore the archived files into a scratch root by re-extracting the tarball
+check "backup tarball is readable" \
+  bash -c 'tar tzf "$1"/files/*.tar.gz >/dev/null 2>&1' _ "$bk_dir"
+
+cat >"$WORK/fakebin6/curl" <<'EOF'
+#!/usr/bin/env bash
+url="${@: -1}"
+out=""; prev=""
+for a in "$@"; do
+  if [[ "$prev" == "-o" ]]; then out="$a"; fi
+  prev="$a"
+done
+if [[ "$url" == */api/cores ]]; then
+  printf '{"count":0,"cores":[]}' >"$out"; printf '200'; exit 0
+fi
+if [[ "$url" == */api/api_keys* ]]; then
+  printf '{"api_keys":[],"total":0}' >"$out"; printf '200'; exit 0
+fi
+if [[ "$url" == */api/admin/token ]]; then
+  printf '{"access_token":"JWT"}' >"$out"; printf '200'; exit 0
+fi
+if [[ "$url" == */api/api_key ]]; then
+  printf '{"id":7,"name":"warp-manager","api_key":"pg_key_created_by_script"}' >"$out"
+  printf '201'; exit 0
+fi
+printf '{}' >"$out"; printf '200'; exit 0
+EOF
+chmod +x "$WORK/fakebin6/curl"
+key_out="$(WARP_APP_DIR="$WORK/key-life-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin6:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_URL="https://panel.example.com" INSECURE=1
+    PANEL_USER="admin" PANEL_PASS="secret"
+    ensure_api_key >/dev/null 2>&1
+    printf "%s|%s" "$PANEL_API_KEY" "$PANEL_AUTH_MODE"' 2>/dev/null || true)"
+assert_eq "ensure_api_key creates a key via the panel API" \
+  "pg_key_created_by_script|api-key" "$key_out"
+check "created key is persisted to state.env" \
+  grep -q 'PANEL_API_KEY=pg_key_created_by_script' "$WORK/key-life-app/state.env"
+mkdir -p "$WORK/fakebin7" "$WORK/rm-app/outbound"
+cat >"$WORK/fakebin7/docker" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+chmod +x "$WORK/fakebin7/docker"
+printf 'INSTALLED=1\nMODE=xray\n' > "$WORK/rm-app/state.env"
+for f in outbounds.json routing-rules.json balancers.json README.txt; do printf '{}' > "$WORK/rm-app/outbound/$f"; done
+cp "$ROOT/warp-manager.sh" "$WORK/rm-app/warp-manager.sh"
+WARP_APP_DIR="$WORK/rm-app" PATH="$WORK/fakebin7:$WORK/bin:$PATH" \
+  bash "$ROOT/warp-manager.sh" remove --yes >/dev/null 2>&1 || true
+check "remove always keeps the pre-remove backup" \
+  bash -c 'ls -d "$1"/backups/full-*pre-remove >/dev/null 2>&1' _ "$WORK/rm-app"
+check "remove keeps the manager script so restore is possible" \
+  test -f "$WORK/rm-app/warp-manager.sh"
+rm_bk="$(ls -d "$WORK"/rm-app/backups/full-*pre-remove 2>/dev/null | head -1)"
+check "generated restore.sh is valid bash" bash -n "$rm_bk/restore.sh"
+rest_err="$(WARP_APP_DIR="$WORK/rm-app" bash "$ROOT/warp-manager.sh" restore /definitely/missing 2>&1 || true)"
+check "restore rejects a missing backup directory" \
+  bash -c '[[ "$1" == *"Usage: warp-manager restore"* ]]' _ "$rest_err"
+key_reuse="$(WARP_APP_DIR="$WORK/key-life-app" WARP_MANAGER="$ROOT/warp-manager.sh" \
+  PATH="$WORK/fakebin6:$PATH" bash -c '
+    source "$WARP_MANAGER"
+    PANEL_URL="https://panel.example.com" INSECURE=1
+    load_saved_api_key
+    ensure_api_key >/dev/null 2>&1
+    printf "%s" "$PANEL_API_KEY"' 2>/dev/null || true)"
+assert_eq "second run reuses the same key across versions" \
+  "pg_key_created_by_script" "$key_reuse"
+
+# ---------------------------------------------------------------------------
 printf '\n[9] Script self-update guards\n'
 check "update rejects a non-bash payload" bash -c "
   WARP_APP_DIR='$WORK/up-app' WARP_UPDATE_URL='file://$ROOT/README.md' \
